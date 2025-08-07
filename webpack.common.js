@@ -1,6 +1,7 @@
 const fg = require('fast-glob');
 const path = require('path');
 const { CleanWebpackPlugin } = require('clean-webpack-plugin');
+const fs = require('fs');
 const CopyPlugin = require('copy-webpack-plugin');
 const ForkTsCheckerWebpackPlugin = require('fork-ts-checker-webpack-plugin');
 const HtmlWebpackPlugin = require('html-webpack-plugin');
@@ -19,6 +20,38 @@ const Assets = [
     'pdfjs-dist/build/pdf.worker.js',
     'libpgs/dist/libpgs.worker.js'
 ];
+
+// Optional libmedia runtime (copied only if installed locally)
+const LIBMEDIA_UMD_DIR = path.resolve(__dirname, 'node_modules/@libmedia/avplayer/dist/umd');
+const LIBMEDIA_ESM_DIR = path.resolve(__dirname, 'node_modules/@libmedia/avplayer/dist/esm');
+const LibmediaAssets = fs.existsSync(LIBMEDIA_ESM_DIR) || fs.existsSync(LIBMEDIA_UMD_DIR)
+    ? [
+        // ESM bundle for dynamic import (avoids import.meta issues in some UMDs)
+        ...(fs.existsSync(LIBMEDIA_ESM_DIR) ? [
+            {
+                from: path.resolve(LIBMEDIA_ESM_DIR, 'avplayer.js'),
+                to: 'libraries/libmedia/esm/avplayer.js'
+            },
+            {
+                from: path.resolve(LIBMEDIA_ESM_DIR, '[0-9]*.avplayer.js'),
+                to: 'libraries/libmedia/esm/[name][ext]',
+                noErrorOnMissing: true
+            }
+        ] : []),
+        // UMD bundle fallback
+        ...(fs.existsSync(LIBMEDIA_UMD_DIR) ? [
+            {
+                from: path.resolve(LIBMEDIA_UMD_DIR, 'avplayer.js'),
+                to: 'libraries/libmedia/avplayer.js'
+            },
+            {
+                from: path.resolve(LIBMEDIA_UMD_DIR, '[0-9]*.avplayer.js'),
+                to: 'libraries/libmedia/[name][ext]',
+                noErrorOnMissing: true
+            }
+        ] : [])
+    ]
+    : [];
 
 const DEV_MODE = process.env.NODE_ENV !== 'production';
 let COMMIT_SHA = '';
@@ -85,6 +118,8 @@ const config = {
                 },
                 'config.json',
                 'robots.txt',
+                // libmedia runtime bundles
+                ...LibmediaAssets,
                 {
                     from: 'touchicon*.png',
                     context: path.resolve(__dirname, 'node_modules/@jellyfin/ux-web/favicons'),
