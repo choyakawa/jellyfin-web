@@ -70,7 +70,7 @@ class LibmediaPlayer {
         this.useFullSubtitleUrls = true;
         this.isLocalPlayer = true;
         this._currentSrc = null;
-        this._volume = htmlMediaHelper.getSavedVolume();
+        this._volume = (htmlMediaHelper.getSavedVolume() || 0) * 100;
         this._muted = false;
         this._playlist = [];
         this._playlistIndex = 0;
@@ -350,11 +350,20 @@ class LibmediaPlayer {
             Events.trigger(this, 'pause');
         });
         this._avplayer.on?.(ev.RESUME || 'resume', () => {
+            const wasPaused = this._paused;
             this._paused = false;
-            Events.trigger(this, 'unpause');
+            if (wasPaused) Events.trigger(this, 'unpause');
         });
         this._avplayer.on?.(ev.PLAYING || 'playing', () => {
+            const wasPaused = this._paused;
+            this._paused = false;
             Events.trigger(this, 'playing');
+            if (wasPaused) Events.trigger(this, 'unpause');
+        });
+        this._avplayer.on?.(ev.PLAYED || 'played', () => {
+            const wasPaused = this._paused;
+            this._paused = false;
+            if (wasPaused) Events.trigger(this, 'unpause');
         });
         this._avplayer.on?.(ev.LOADING || 'loading', () => {
             Events.trigger(this, 'waiting');
@@ -372,10 +381,10 @@ class LibmediaPlayer {
         this._avplayer.on?.(ev.ERROR || 'error', (err) => {
             Events.trigger(this, 'error', [err?.message || 'ErrorDefault']);
         });
-        this._avplayer.on?.(ev.STREAM_UPDATE || 'stream_update', () => {
+        this._avplayer.on?.(ev.STREAM_UPDATE || 'streamUpdate', () => {
             Events.trigger(this, 'mediastreamschange');
         });
-        this._avplayer.on?.(ev.VOLUME_CHANGE || 'volume_change', () => {
+        this._avplayer.on?.(ev.VOLUME_CHANGE || 'volumeChange', () => {
             Events.trigger(this, 'volumechange');
         });
     }
@@ -435,6 +444,13 @@ class LibmediaPlayer {
         return this._avplayer?.play();
     }
 
+    playPause() {
+        if (this.paused()) {
+            return this.unpause();
+        }
+        return this.pause();
+    }
+
     paused() {
         return !!this._paused;
     }
@@ -447,25 +463,27 @@ class LibmediaPlayer {
     }
 
     setVolume(val) {
-        this._volume = Math.max(0, Math.min(1, val || 0));
-        htmlMediaHelper.saveVolume(this._volume);
+        const clamped = Math.max(0, Math.min(100, Number(val) || 0));
+        this._volume = clamped;
+        htmlMediaHelper.saveVolume(clamped / 100);
         if (this._avplayer?.setVolume) {
-            this._avplayer.setVolume(this._volume, true);
+            this._avplayer.setVolume(clamped / 100, true);
         }
         Events.trigger(this, 'volumechange');
     }
 
     getVolume() {
-        return this._volume;
+        return Math.max(0, Math.min(100, Number(this._volume) || 0));
     }
 
     setMute(mute) {
         this._muted = !!mute;
         if (this._muted) {
-            this._lastVolume = this._volume;
+            this._lastVolume = this.getVolume();
             this.setVolume(0);
         } else {
-            this.setVolume(this._lastVolume || htmlMediaHelper.getSavedVolume());
+            const saved = this._lastVolume != null ? this._lastVolume : (htmlMediaHelper.getSavedVolume() * 100);
+            this.setVolume(saved);
         }
     }
 
