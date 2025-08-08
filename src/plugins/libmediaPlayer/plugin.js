@@ -220,7 +220,7 @@ class LibmediaPlayer {
             Events.trigger(this, 'beginFetch');
             await this._avplayer.load(url);
 
-            // initial volume
+            // initial volume - ensure correct range 
             this.setVolume(this._volume);
 
             // Load external subtitles if present (from playbackManager.getTextTracks)
@@ -258,8 +258,12 @@ class LibmediaPlayer {
             // seek to start position if requested
             const startTicks = options.playerStartPositionTicks || 0;
             if (startTicks > 0) {
-                const ms = Math.floor(startTicks / 10000);
-                await this._avplayer.seek(ms);
+                const ms = BigInt(Math.floor(startTicks / 10000));
+                try {
+                    await this._avplayer.seek(ms);
+                } catch (err) {
+                    console.warn('Initial seek failed:', err);
+                }
             }
 
             // Auto select initial audio/subtitle per Jellyfin defaults
@@ -372,6 +376,12 @@ class LibmediaPlayer {
             // signal ready state; htmlVideoPlayer uses 'playing', but LOADED can occur earlier
             Events.trigger(this, 'playing');
         });
+        this._avplayer.on?.(ev.SEEKING || 'seeking', () => {
+            Events.trigger(this, 'waiting');
+        });
+        this._avplayer.on?.(ev.SEEKED || 'seeked', () => {
+            Events.trigger(this, 'playing');
+        });
         this._avplayer.on?.(ev.ENDED || 'ended', () => {
             this._onEndedInternal();
         });
@@ -403,14 +413,16 @@ class LibmediaPlayer {
     currentTime(val) {
         if (!this._avplayer) return 0;
         if (val != null) {
-            const ms = Math.floor(val);
-            this._avplayer.seek(ms);
+            // Convert to bigint for libmedia
+            const ms = BigInt(Math.floor(val));
+            this._avplayer.seek(ms).catch(err => {
+                console.error('currentTime seek failed:', err);
+            });
             return;
         }
-        // libmedia exposes ms value
+        // libmedia exposes ms value as bigint, convert to number
         try {
-            // eslint-disable-next-line no-undef
-            return Number(this._avplayer.currentTime || 0);
+            return Number(this._avplayer.currentTime || 0n);
         } catch {
             return 0;
         }
@@ -426,10 +438,16 @@ class LibmediaPlayer {
         return null;
     }
 
-    seek(ticks) {
-        if (!this._avplayer) return;
-        const ms = Math.floor((ticks || 0) / 10000);
-        return this._avplayer.seek(ms);
+    async seek(ticks) {
+        if (!this._avplayer) return Promise.reject(new Error('Player not initialized'));
+        try {
+            // Convert jellyfin ticks to milliseconds bigint
+            const ms = BigInt(Math.floor((ticks || 0) / 10000));
+            await this._avplayer.seek(ms);
+        } catch (err) {
+            console.error('Seek failed:', err);
+            throw err;
+        }
     }
 
     pause() {
