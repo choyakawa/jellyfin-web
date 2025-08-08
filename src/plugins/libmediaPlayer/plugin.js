@@ -62,6 +62,8 @@ class LibmediaPlayer {
         this.name = 'Libmedia Player';
         this.type = PluginType.MediaPlayer;
         this.id = 'libmediaplayer';
+        // Reuse HtmlVideoPlayer SyncPlay wrapper to avoid unknown-wrapper fallback
+        this.syncPlayWrapAs = 'htmlvideoplayer';
         // Take priority over HTML players (which default to 1)
         this.priority = 0;
         // Let playbackmanager expand DeliveryUrl to absolute
@@ -271,14 +273,23 @@ class LibmediaPlayer {
                 }
             } catch {}
 
-            // Show UI after playback starts
-            if (options.fullscreen) {
-                await appRouter.showVideoOsd();
-                this._videoDialog.classList.remove('onTop');
-            } else {
-                setBackdropTransparency(TRANSPARENCY_LEVEL.Backdrop);
-                this._videoDialog.classList.remove('onTop');
-            }
+            // Show UI after playback starts.
+            // IMPORTANT: Defer showVideoOsd until after playbackmanager sets current player (on playbackstart)
+            const handlePlaybackStart = () => {
+                try {
+                    if (options.fullscreen) {
+                        appRouter.showVideoOsd().then(() => {
+                            this._videoDialog?.classList.remove('onTop');
+                        });
+                    } else {
+                        setBackdropTransparency(TRANSPARENCY_LEVEL.Backdrop);
+                        this._videoDialog?.classList.remove('onTop');
+                    }
+                } finally {
+                    Events.off(this, 'playbackstart', handlePlaybackStart);
+                }
+            };
+            Events.on(this, 'playbackstart', handlePlaybackStart);
 
             loading.hide();
             this.isFetching = false;
@@ -343,6 +354,13 @@ class LibmediaPlayer {
             Events.trigger(this, 'unpause');
         });
         this._avplayer.on?.(ev.PLAYING || 'playing', () => {
+            Events.trigger(this, 'playing');
+        });
+        this._avplayer.on?.(ev.LOADING || 'loading', () => {
+            Events.trigger(this, 'waiting');
+        });
+        this._avplayer.on?.(ev.LOADED || 'loaded', () => {
+            // signal ready state; htmlVideoPlayer uses 'playing', but LOADED can occur earlier
             Events.trigger(this, 'playing');
         });
         this._avplayer.on?.(ev.ENDED || 'ended', () => {
@@ -460,6 +478,19 @@ class LibmediaPlayer {
         return !!this._avplayer?.selectAudio;
     }
 
+    getAudioStreamIndex() {
+        try {
+            const jfStreams = this._currentPlayOptions?.mediaSource?.MediaStreams || [];
+            const streams = this._avplayer.getStreams?.() || [];
+            const current = this._avplayer.selectedAudioStream || null;
+            if (!current) return null;
+            const match = jfStreams.find((s) => s.Type === 'Audio' && s.Index === current.index);
+            return match ? match.Index : null;
+        } catch {
+            return null;
+        }
+    }
+
     setAudioStreamIndex(index) {
         if (!this._avplayer?.selectAudio) return;
         const libId = this._mapJellyfinStreamIndexToLibId(index, 'audio');
@@ -480,6 +511,18 @@ class LibmediaPlayer {
         }
     }
 
+    getSubtitleStreamIndex() {
+        try {
+            const jfStreams = this._currentPlayOptions?.mediaSource?.MediaStreams || [];
+            const current = this._avplayer?.selectedSubtitleStream || null;
+            if (!current) return -1;
+            const match = jfStreams.find((s) => s.Type === 'Subtitle' && s.Index === current.index);
+            return match ? match.Index : -1;
+        } catch {
+            return -1;
+        }
+    }
+
     _mapJellyfinStreamIndexToLibId(jfIndex, kind /* 'audio' | 'subtitle' */) {
         try {
             const streams = this._avplayer.getStreams?.() || [];
@@ -491,15 +534,14 @@ class LibmediaPlayer {
             const jfStream = jfStreams.find((s) => s.Index === jfIndex && ((kind === 'audio' && s.Type === 'Audio') || (kind === 'subtitle' && s.Type === 'Subtitle')));
             if (!jfStream) return null;
 
-            // Map by ffmpeg-like stream.index first
-            const targetCodecType = kind === 'audio' ? 'AVMEDIA_TYPE_AUDIO' : 'AVMEDIA_TYPE_SUBTITLE';
-            let match = streams.find((s) => (s.index === jfStream.Index) && ((s.codecparProxy?.codecType || s.codecpar?.codecType) === targetCodecType || s.mediaType === kind));
+            // Map by container stream index first (most reliable across sources)
+            let match = streams.find((s) => s.index === jfStream.Index);
             if (match) return match.id;
 
             // Fallback: try to match by language/title heuristics
             const lang = (jfStream.Language || jfStream.lang || '').toLowerCase();
             const title = (jfStream.DisplayTitle || jfStream.Title || '').toLowerCase();
-            const candidates = streams.filter((s) => ((s.codecparProxy?.codecType || s.codecpar?.codecType) === targetCodecType || s.mediaType === kind));
+            const candidates = streams;
             match = candidates.find((s) => {
                 const md = s.metadata || {};
                 const sLang = String(md?.LANGUAGE || md?.language || '').toLowerCase();
@@ -649,6 +691,27 @@ class LibmediaPlayer {
         tryRemoveElement(this._videoDialog);
         this._videoDialog = null;
         this._container = null;
+    }
+
+    // Fullscreen helpers for OSD controls
+    isFullscreen() {
+        if (Screenfull.isEnabled) return Screenfull.isFullscreen;
+        // iOS Safari
+        return document.webkitIsFullScreen || false;
+    }
+
+    toggleFullscreen() {
+        if (Screenfull.isEnabled) {
+            Screenfull.toggle();
+            return;
+        }
+        // iOS Safari fallback
+        const el = document.documentElement;
+        if (!document.webkitIsFullScreen && el.webkitRequestFullscreen) {
+            el.webkitRequestFullscreen();
+        } else if (document.webkitIsFullScreen && document.webkitCancelFullscreen) {
+            document.webkitCancelFullscreen();
+        }
     }
 }
 
