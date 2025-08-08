@@ -72,6 +72,9 @@ class LibmediaPlayer {
         this._muted = false;
         this._playlist = [];
         this._playlistIndex = 0;
+        this._currentPlayOptions = null;
+        this._subtitleIndexToLibId = new Map();
+        this._showSubtitleOffset = false;
     }
 
     canPlayMediaType(mediaType) {
@@ -115,6 +118,8 @@ class LibmediaPlayer {
         this._started = false;
         this._timeUpdated = false;
         this._paused = false;
+        this._currentPlayOptions = options;
+        this._subtitleIndexToLibId.clear();
 
         await ensureAVPlayerLoaded();
 
@@ -208,20 +213,34 @@ class LibmediaPlayer {
         this._bindEvents(options);
 
         try {
+            // Show fetching indicator for OSD
+            this.isFetching = true;
+            Events.trigger(this, 'beginFetch');
             await this._avplayer.load(url);
 
             // initial volume
             this.setVolume(this._volume);
 
-            // Load external subtitles if present
+            // Load external subtitles if present (from playbackManager.getTextTracks)
             const extTracks = options?.textTracks || options?.tracks || [];
+            // Snapshot streams before loading externals to map jf index -> libmedia id
+            const seenStreamIds = new Set((this._avplayer.getStreams?.() || []).map((s) => s.id));
             for (const t of extTracks) {
-                if (t.DeliveryMethod === 'External' && t.DeliveryUrl) {
-                    try {
-                        await this._avplayer.loadExternalSubtitle({ source: t.DeliveryUrl, title: t.DisplayTitle, lang: t.Language });
-                    } catch (e) {
-                        console.warn('loadExternalSubtitle failed', e);
+                const src = t.url || t.DeliveryUrl;
+                if (!src) continue;
+                try {
+                    await this._avplayer.loadExternalSubtitle({ source: src, title: t.DisplayTitle, lang: t.language || t.Language });
+                    // Find the newly added subtitle stream and map it to jf index
+                    const streams = this._avplayer.getStreams?.() || [];
+                    const newSubtitle = streams
+                        .filter((s) => s?.codecparProxy?.codecType === 'AVMEDIA_TYPE_SUBTITLE' || s?.codecpar?.codecType === 3)
+                        .find((s) => !seenStreamIds.has(s.id));
+                    if (newSubtitle && typeof t.index === 'number') {
+                        this._subtitleIndexToLibId.set(t.index, newSubtitle.id);
+                        seenStreamIds.add(newSubtitle.id);
                     }
+                } catch (e) {
+                    console.warn('loadExternalSubtitle failed', e);
                 }
             }
 
@@ -241,6 +260,17 @@ class LibmediaPlayer {
                 await this._avplayer.seek(ms);
             }
 
+            // Auto select initial audio/subtitle per Jellyfin defaults
+            try {
+                const ms = options?.mediaSource;
+                if (ms?.DefaultAudioStreamIndex != null) {
+                    this.setAudioStreamIndex(ms.DefaultAudioStreamIndex);
+                }
+                if (ms?.DefaultSubtitleStreamIndex != null) {
+                    this.setSubtitleStreamIndex(ms.DefaultSubtitleStreamIndex);
+                }
+            } catch {}
+
             // Show UI after playback starts
             if (options.fullscreen) {
                 await appRouter.showVideoOsd();
@@ -251,8 +281,12 @@ class LibmediaPlayer {
             }
 
             loading.hide();
+            this.isFetching = false;
+            Events.trigger(this, 'endFetch');
         } catch (err) {
             loading.hide();
+            this.isFetching = false;
+            Events.trigger(this, 'endFetch');
             // Signal error to playback manager
             Events.trigger(this, 'error', [err && err.message ? err.message : 'ErrorDefault']);
             throw err;
@@ -294,28 +328,37 @@ class LibmediaPlayer {
 
     _bindEvents() {
         if (!this._avplayer) return;
-        // eslint-disable-next-line no-undef
         const ev = window.AVPlayer?.eventType || {};
-        this._avplayer.on?.('time', () => {
+        // time updates for OSD slider
+        this._avplayer.on?.(ev.TIME || 'time', () => {
             this._timeUpdated = true;
             Events.trigger(this, 'timeupdate');
         });
-        this._avplayer.on?.('paused', () => {
+        this._avplayer.on?.(ev.PAUSED || 'paused', () => {
             this._paused = true;
             Events.trigger(this, 'pause');
         });
-        this._avplayer.on?.('resume', () => {
+        this._avplayer.on?.(ev.RESUME || 'resume', () => {
             this._paused = false;
             Events.trigger(this, 'unpause');
         });
-        this._avplayer.on?.('ended', () => {
+        this._avplayer.on?.(ev.PLAYING || 'playing', () => {
+            Events.trigger(this, 'playing');
+        });
+        this._avplayer.on?.(ev.ENDED || 'ended', () => {
             this._onEndedInternal();
         });
-        this._avplayer.on?.('stopped', () => {
+        this._avplayer.on?.(ev.STOPPED || 'stopped', () => {
             this._onEndedInternal();
         });
-        this._avplayer.on?.('error', (err) => {
+        this._avplayer.on?.(ev.ERROR || 'error', (err) => {
             Events.trigger(this, 'error', [err?.message || 'ErrorDefault']);
+        });
+        this._avplayer.on?.(ev.STREAM_UPDATE || 'stream_update', () => {
+            Events.trigger(this, 'mediastreamschange');
+        });
+        this._avplayer.on?.(ev.VOLUME_CHANGE || 'volume_change', () => {
+            Events.trigger(this, 'volumechange');
         });
     }
 
@@ -418,14 +461,54 @@ class LibmediaPlayer {
     }
 
     setAudioStreamIndex(index) {
-        if (this._avplayer?.selectAudio) {
-            return this._avplayer.selectAudio(index);
-        }
+        if (!this._avplayer?.selectAudio) return;
+        const libId = this._mapJellyfinStreamIndexToLibId(index, 'audio');
+        if (libId != null) return this._avplayer.selectAudio(libId);
     }
 
     setSubtitleStreamIndex(index) {
-        if (this._avplayer?.selectSubtitle) {
-            return this._avplayer.selectSubtitle(index);
+        if (!this._avplayer) return;
+        if (index == null || index === -1) {
+            // disable subtitles
+            try { this._avplayer.setSubtitleEnable?.(false); } catch {}
+            return;
+        }
+        const libId = this._mapJellyfinStreamIndexToLibId(index, 'subtitle');
+        if (libId != null && this._avplayer.selectSubtitle) {
+            try { this._avplayer.setSubtitleEnable?.(true); } catch {}
+            return this._avplayer.selectSubtitle(libId);
+        }
+    }
+
+    _mapJellyfinStreamIndexToLibId(jfIndex, kind /* 'audio' | 'subtitle' */) {
+        try {
+            const streams = this._avplayer.getStreams?.() || [];
+            // Fast path for previously mapped externals
+            if (kind === 'subtitle' && this._subtitleIndexToLibId.has(jfIndex)) {
+                return this._subtitleIndexToLibId.get(jfIndex);
+            }
+            const jfStreams = this._currentPlayOptions?.mediaSource?.MediaStreams || [];
+            const jfStream = jfStreams.find((s) => s.Index === jfIndex && ((kind === 'audio' && s.Type === 'Audio') || (kind === 'subtitle' && s.Type === 'Subtitle')));
+            if (!jfStream) return null;
+
+            // Map by ffmpeg-like stream.index first
+            const targetCodecType = kind === 'audio' ? 'AVMEDIA_TYPE_AUDIO' : 'AVMEDIA_TYPE_SUBTITLE';
+            let match = streams.find((s) => (s.index === jfStream.Index) && ((s.codecparProxy?.codecType || s.codecpar?.codecType) === targetCodecType || s.mediaType === kind));
+            if (match) return match.id;
+
+            // Fallback: try to match by language/title heuristics
+            const lang = (jfStream.Language || jfStream.lang || '').toLowerCase();
+            const title = (jfStream.DisplayTitle || jfStream.Title || '').toLowerCase();
+            const candidates = streams.filter((s) => ((s.codecparProxy?.codecType || s.codecpar?.codecType) === targetCodecType || s.mediaType === kind));
+            match = candidates.find((s) => {
+                const md = s.metadata || {};
+                const sLang = String(md?.LANGUAGE || md?.language || '').toLowerCase();
+                const sTitle = String(md?.TITLE || md?.title || '').toLowerCase();
+                return (lang && sLang === lang) || (title && sTitle === title);
+            });
+            return match ? match.id : null;
+        } catch {
+            return null;
         }
     }
 
@@ -470,6 +553,94 @@ class LibmediaPlayer {
             }
         };
         return doDestroy();
+    }
+
+    // Subtitles offset support (seconds)
+    setSubtitleOffset(offsetSeconds) {
+        const ms = Math.round((Number(offsetSeconds) || 0) * 1000);
+        try { this._avplayer?.setSubtitleDelay?.(ms); } catch {}
+    }
+
+    getSubtitleOffset() {
+        try {
+            const ms = this._avplayer?.getSubtitleDelay?.() ?? 0;
+            return Number(ms) / 1000;
+        } catch {
+            return 0;
+        }
+    }
+
+    enableShowingSubtitleOffset() {
+        this._showSubtitleOffset = true;
+    }
+
+    disableShowingSubtitleOffset() {
+        this._showSubtitleOffset = false;
+    }
+
+    isShowingSubtitleOffsetEnabled() {
+        return !!this._showSubtitleOffset;
+    }
+
+    // Optional: buffer ranges for OSD slider
+    getBufferedRanges() {
+        try {
+            const media = this._avplayer?.video || this._avplayer?.audio;
+            const ranges = [];
+            if (!media?.buffered) return ranges;
+            const offset = (this._currentPlayOptions?.transcodingOffsetTicks || 0);
+            for (let i = 0; i < media.buffered.length; i++) {
+                const start = media.buffered.start(i);
+                const end = media.buffered.end(i);
+                if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+                    ranges.push({ start: (start * 10000000) + offset, end: (end * 10000000) + offset });
+                }
+            }
+            return ranges;
+        } catch {
+            return [];
+        }
+    }
+
+    // Feature flags queried by OSD
+    supports(feature) {
+        switch (feature) {
+            case 'PlaybackRate': return typeof this._avplayer?.getPlaybackRate === 'function';
+            case 'SetAspectRatio': return true;
+            case 'SetBrightness': return false;
+            // No SecondarySubtitles for libmedia (single track render)
+            default: return false;
+        }
+    }
+
+    setPlaybackRate(rate) {
+        try { this._avplayer?.setPlaybackRate?.(Number(rate)); } catch {}
+    }
+
+    getPlaybackRate() {
+        try { return this._avplayer?.getPlaybackRate?.() ?? 1; } catch { return 1; }
+    }
+
+    // Aspect ratio mapping to CSS object-fit on container canvas
+    setAspectRatio(val) {
+        // Map to render mode if available, otherwise adjust canvas style
+        try {
+            const renderMode = (window.AVPlayer?.RenderMode) || {};
+            if (this._avplayer?.setRenderMode && renderMode) {
+                if (val === 'cover') this._avplayer.setRenderMode(renderMode.FILL);
+                else if (val === 'fill') this._avplayer.setRenderMode(renderMode.FILL);
+                else this._avplayer.setRenderMode(renderMode.FIT);
+                return;
+            }
+        } catch {}
+        // Fallback: CSS
+        if (this._container) {
+            const canvas = this._container.querySelector('canvas');
+            if (canvas) {
+                if (val === 'auto') canvas.style.removeProperty('object-fit');
+                else canvas.style.objectFit = val;
+            }
+        }
     }
 
     destroy() {
