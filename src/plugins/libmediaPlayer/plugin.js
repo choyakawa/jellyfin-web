@@ -76,6 +76,7 @@ class LibmediaPlayer {
         this._playlistIndex = 0;
         this._currentPlayOptions = null;
         this._subtitleIndexToLibId = new Map();
+        this._externalSubtitleInfo = new Map();
         this._showSubtitleOffset = false;
     }
 
@@ -122,6 +123,7 @@ class LibmediaPlayer {
         this._paused = false;
         this._currentPlayOptions = options;
         this._subtitleIndexToLibId.clear();
+        this._externalSubtitleInfo.clear();
 
         await ensureAVPlayerLoaded();
 
@@ -223,27 +225,15 @@ class LibmediaPlayer {
             // initial volume - ensure correct range 
             this.setVolume(this._volume);
 
-            // Load external subtitles if present (from playbackManager.getTextTracks)
-            const extTracks = options?.textTracks || options?.tracks || [];
-            // Snapshot streams before loading externals to map jf index -> libmedia id
-            const seenStreamIds = new Set((this._avplayer.getStreams?.() || []).map((s) => s.id));
-            for (const t of extTracks) {
-                const src = t.url || t.DeliveryUrl;
-                if (!src) continue;
-                try {
-                    await this._avplayer.loadExternalSubtitle({ source: src, title: t.DisplayTitle, lang: t.language || t.Language });
-                    // Find the newly added subtitle stream and map it to jf index
-                    const streams = this._avplayer.getStreams?.() || [];
-                    const newSubtitle = streams
-                        .filter((s) => s?.codecparProxy?.codecType === 'AVMEDIA_TYPE_SUBTITLE' || s?.codecpar?.codecType === 3)
-                        .find((s) => !seenStreamIds.has(s.id));
-                    if (newSubtitle && typeof t.index === 'number') {
-                        this._subtitleIndexToLibId.set(t.index, newSubtitle.id);
-                        seenStreamIds.add(newSubtitle.id);
-                    }
-                } catch (e) {
-                    console.warn('loadExternalSubtitle failed', e);
-                }
+            // Store external subtitle info for lazy loading (don't load them now)
+            const mediaStreams = options?.mediaSource?.MediaStreams || [];
+            const externalSubtitles = mediaStreams.filter(s => s.Type === 'Subtitle' && s.IsExternal);
+            
+            // Store external subtitle metadata for later use
+            this._externalSubtitleInfo = new Map();
+            for (const extSubtitle of externalSubtitles) {
+                this._externalSubtitleInfo.set(extSubtitle.Index, extSubtitle);
+                console.debug(`Registered external subtitle: ${extSubtitle.DisplayTitle || extSubtitle.Title || 'Unknown'} (Index: ${extSubtitle.Index})`);
             }
 
             try {
@@ -270,12 +260,18 @@ class LibmediaPlayer {
             try {
                 const ms = options?.mediaSource;
                 if (ms?.DefaultAudioStreamIndex != null) {
-                    this.setAudioStreamIndex(ms.DefaultAudioStreamIndex);
+                    await this.setAudioStreamIndex(ms.DefaultAudioStreamIndex);
                 }
                 if (ms?.DefaultSubtitleStreamIndex != null) {
-                    this.setSubtitleStreamIndex(ms.DefaultSubtitleStreamIndex);
+                    // Check if default subtitle is external and load it if needed
+                    if (this._externalSubtitleInfo.has(ms.DefaultSubtitleStreamIndex)) {
+                        console.debug(`Default subtitle is external (index ${ms.DefaultSubtitleStreamIndex}), loading on demand`);
+                    }
+                    await this.setSubtitleStreamIndex(ms.DefaultSubtitleStreamIndex);
                 }
-            } catch {}
+            } catch (error) {
+                console.warn('Error setting default streams:', error);
+            }
 
             // Show UI after playback starts.
             // IMPORTANT: Defer showVideoOsd until after playbackmanager sets current player (on playbackstart)
@@ -520,41 +516,129 @@ class LibmediaPlayer {
             const streams = this._avplayer.getStreams?.() || [];
             const current = this._avplayer.selectedAudioStream || null;
             if (!current) return null;
-            const match = jfStreams.find((s) => s.Type === 'Audio' && s.Index === current.index);
-            return match ? match.Index : null;
-        } catch {
+
+            // Get audio streams from jellyfin (excluding external ones)
+            const jfAudioStreams = jfStreams.filter((s) => s.Type === 'Audio' && !s.IsExternal)
+                .sort((a, b) => a.Index - b.Index);
+
+            // Get audio streams from libmedia
+            const libAudioStreams = streams.filter((s) => {
+                const codecType = s.codecpar?.codecType || s.codecparProxy?.codecType;
+                return codecType === 1 || codecType === 'AVMEDIA_TYPE_AUDIO';
+            });
+
+            // Find position of current libmedia stream in libmedia audio streams
+            const libStreamPosition = libAudioStreams.findIndex((s) => s.id === current.id);
+            if (libStreamPosition >= 0 && libStreamPosition < jfAudioStreams.length) {
+                const jfStream = jfAudioStreams[libStreamPosition];
+                console.debug(`Current audio stream libmedia id ${current.id} maps to jellyfin index ${jfStream.Index}`);
+                return jfStream.Index;
+            }
+
+            console.warn(`Failed to map current libmedia audio stream id ${current.id} to jellyfin index`);
+            return null;
+        } catch (error) {
+            console.error('Error getting audio stream index:', error);
             return null;
         }
     }
 
-    setAudioStreamIndex(index) {
+    async setAudioStreamIndex(index) {
         if (!this._avplayer?.selectAudio) return;
-        const libId = this._mapJellyfinStreamIndexToLibId(index, 'audio');
-        if (libId != null) return this._avplayer.selectAudio(libId);
+        
+        try {
+            const libId = this._mapJellyfinStreamIndexToLibId(index, 'audio');
+            if (libId != null) {
+                console.debug(`Switching to audio stream jellyfin index ${index}, libmedia id ${libId}`);
+                await this._avplayer.selectAudio(libId);
+                console.debug(`Successfully switched to audio stream ${libId}`);
+            } else {
+                console.warn(`Failed to map jellyfin audio stream index ${index} to libmedia id`);
+            }
+        } catch (error) {
+            console.error(`Error switching audio stream to index ${index}:`, error);
+            // Don't rethrow to avoid crashing the player
+        }
     }
 
-    setSubtitleStreamIndex(index) {
+    async setSubtitleStreamIndex(index) {
         if (!this._avplayer) return;
-        if (index == null || index === -1) {
-            // disable subtitles
-            try { this._avplayer.setSubtitleEnable?.(false); } catch {}
-            return;
-        }
-        const libId = this._mapJellyfinStreamIndexToLibId(index, 'subtitle');
-        if (libId != null && this._avplayer.selectSubtitle) {
-            try { this._avplayer.setSubtitleEnable?.(true); } catch {}
-            return this._avplayer.selectSubtitle(libId);
+        
+        try {
+            if (index == null || index === -1) {
+                // disable subtitles
+                console.debug('Disabling subtitles');
+                try { 
+                    this._avplayer.setSubtitleEnable?.(false); 
+                } catch (e) {
+                    console.warn('Error disabling subtitles:', e);
+                }
+                return;
+            }
+            
+            // Check if this is an external subtitle that needs to be loaded
+            if (this._externalSubtitleInfo.has(index) && !this._subtitleIndexToLibId.has(index)) {
+                await this._loadExternalSubtitle(index);
+            }
+            
+            const libId = this._mapJellyfinStreamIndexToLibId(index, 'subtitle');
+            if (libId != null && this._avplayer.selectSubtitle) {
+                console.debug(`Switching to subtitle stream jellyfin index ${index}, libmedia id ${libId}`);
+                
+                try { 
+                    this._avplayer.setSubtitleEnable?.(true); 
+                } catch (e) {
+                    console.warn('Error enabling subtitles:', e);
+                }
+                
+                await this._avplayer.selectSubtitle(libId);
+                console.debug(`Successfully switched to subtitle stream ${libId}`);
+            } else {
+                console.warn(`Failed to map jellyfin subtitle stream index ${index} to libmedia id`);
+            }
+        } catch (error) {
+            console.error(`Error switching subtitle stream to index ${index}:`, error);
+            // Don't rethrow to avoid crashing the player
         }
     }
 
     getSubtitleStreamIndex() {
         try {
             const jfStreams = this._currentPlayOptions?.mediaSource?.MediaStreams || [];
+            const streams = this._avplayer.getStreams?.() || [];
             const current = this._avplayer?.selectedSubtitleStream || null;
             if (!current) return -1;
-            const match = jfStreams.find((s) => s.Type === 'Subtitle' && s.Index === current.index);
-            return match ? match.Index : -1;
-        } catch {
+
+            // Check if it's an external subtitle we mapped earlier
+            for (const [jfIndex, libId] of this._subtitleIndexToLibId.entries()) {
+                if (libId === current.id) {
+                    console.debug(`Current subtitle stream libmedia id ${current.id} maps to jellyfin external index ${jfIndex}`);
+                    return jfIndex;
+                }
+            }
+
+            // Get subtitle streams from jellyfin (excluding external ones)
+            const jfSubtitleStreams = jfStreams.filter((s) => s.Type === 'Subtitle' && !s.IsExternal)
+                .sort((a, b) => a.Index - b.Index);
+
+            // Get subtitle streams from libmedia
+            const libSubtitleStreams = streams.filter((s) => {
+                const codecType = s.codecpar?.codecType || s.codecparProxy?.codecType;
+                return codecType === 3 || codecType === 'AVMEDIA_TYPE_SUBTITLE';
+            });
+
+            // Find position of current libmedia stream in libmedia subtitle streams
+            const libStreamPosition = libSubtitleStreams.findIndex((s) => s.id === current.id);
+            if (libStreamPosition >= 0 && libStreamPosition < jfSubtitleStreams.length) {
+                const jfStream = jfSubtitleStreams[libStreamPosition];
+                console.debug(`Current subtitle stream libmedia id ${current.id} maps to jellyfin index ${jfStream.Index}`);
+                return jfStream.Index;
+            }
+
+            console.warn(`Failed to map current libmedia subtitle stream id ${current.id} to jellyfin index`);
+            return -1;
+        } catch (error) {
+            console.error('Error getting subtitle stream index:', error);
             return -1;
         }
     }
@@ -570,23 +654,144 @@ class LibmediaPlayer {
             const jfStream = jfStreams.find((s) => s.Index === jfIndex && ((kind === 'audio' && s.Type === 'Audio') || (kind === 'subtitle' && s.Type === 'Subtitle')));
             if (!jfStream) return null;
 
-            // Map by container stream index first (most reliable across sources)
-            let match = streams.find((s) => s.index === jfStream.Index);
-            if (match) return match.id;
+            // Get streams of the same type from libmedia
+            const libStreams = streams.filter((s) => {
+                const codecType = s.codecpar?.codecType || s.codecparProxy?.codecType;
+                if (kind === 'audio') {
+                    return codecType === 1 || codecType === 'AVMEDIA_TYPE_AUDIO';
+                } else if (kind === 'subtitle') {
+                    return codecType === 3 || codecType === 'AVMEDIA_TYPE_SUBTITLE';
+                }
+                return false;
+            });
+
+            // Get jellyfin streams of the same type (excluding external ones for ordering)
+            const jfStreamsOfType = jfStreams.filter((s) => {
+                if (kind === 'audio') {
+                    return s.Type === 'Audio' && !s.IsExternal;
+                } else if (kind === 'subtitle') {
+                    return s.Type === 'Subtitle' && !s.IsExternal;
+                }
+                return false;
+            }).sort((a, b) => a.Index - b.Index);
+
+            // Find the position of the target stream in jellyfin streams of the same type
+            const jfStreamPosition = jfStreamsOfType.findIndex((s) => s.Index === jfIndex);
+            if (jfStreamPosition >= 0 && jfStreamPosition < libStreams.length) {
+                // Map by position in the same type streams
+                const libStream = libStreams[jfStreamPosition];
+                console.debug(`Mapped jellyfin ${kind} stream index ${jfIndex} to libmedia stream id ${libStream.id} (position ${jfStreamPosition})`);
+                return libStream.id;
+            }
 
             // Fallback: try to match by language/title heuristics
             const lang = (jfStream.Language || jfStream.lang || '').toLowerCase();
             const title = (jfStream.DisplayTitle || jfStream.Title || '').toLowerCase();
-            const candidates = streams;
-            match = candidates.find((s) => {
+            const codec = (jfStream.Codec || '').toLowerCase();
+            
+            const match = libStreams.find((s) => {
                 const md = s.metadata || {};
                 const sLang = String(md?.LANGUAGE || md?.language || '').toLowerCase();
                 const sTitle = String(md?.TITLE || md?.title || '').toLowerCase();
-                return (lang && sLang === lang) || (title && sTitle === title);
+                
+                // Try to match by language first, then title, then codec
+                if (lang && sLang === lang) return true;
+                if (title && sTitle === title) return true;
+                if (codec && s.codecpar?.codecId && this._getCodecName(s.codecpar.codecId).toLowerCase().includes(codec)) return true;
+                
+                return false;
             });
-            return match ? match.id : null;
-        } catch {
+            
+            if (match) {
+                console.debug(`Mapped jellyfin ${kind} stream index ${jfIndex} to libmedia stream id ${match.id} (by metadata)`);
+                return match.id;
+            }
+
+            console.warn(`Failed to map jellyfin ${kind} stream index ${jfIndex} to libmedia stream`);
             return null;
+        } catch (error) {
+            console.error(`Error mapping jellyfin stream index ${jfIndex} to libmedia:`, error);
+            return null;
+        }
+    }
+
+    _getCodecName(codecId) {
+        // Simple codec ID to name mapping for common codecs
+        const codecMap = {
+            86018: 'aac',
+            86019: 'ac3',
+            86056: 'eac3',
+            86017: 'mp3',
+            86028: 'flac',
+            86076: 'opus',
+            27: 'h264',
+            173: 'hevc',
+            225: 'av1'
+        };
+        return codecMap[codecId] || `codec_${codecId}`;
+    }
+
+    async _loadExternalSubtitle(jfIndex) {
+        const extSubtitle = this._externalSubtitleInfo.get(jfIndex);
+        if (!extSubtitle) {
+            console.warn(`No external subtitle info found for index ${jfIndex}`);
+            return;
+        }
+
+        try {
+            // Snapshot current streams to find newly added one
+            const seenStreamIds = new Set((this._avplayer.getStreams?.() || []).map((s) => s.id));
+
+            let src = extSubtitle.DeliveryUrl;
+            // If DeliveryUrl is not available, construct it from Path and server info
+            if (!src && extSubtitle.Path) {
+                const apiClient = ServerConnections.getApiClient(this._currentPlayOptions.item.ServerId);
+                if (extSubtitle.Path.startsWith('/')) {
+                    // External subtitle file needs special handling - construct URL similar to _computeUrl
+                    const subtitleExt = (extSubtitle.Codec || 'vtt').toLowerCase();
+                    const directOptions = {
+                        Static: true,
+                        mediaSourceId: this._currentPlayOptions.mediaSource.Id,
+                        deviceId: apiClient.deviceId(),
+                        ApiKey: apiClient.accessToken()
+                    };
+                    if (this._currentPlayOptions.mediaSource.ETag) directOptions.Tag = this._currentPlayOptions.mediaSource.ETag;
+                    if (this._currentPlayOptions.mediaSource.LiveStreamId) directOptions.LiveStreamId = this._currentPlayOptions.mediaSource.LiveStreamId;
+                    
+                    src = apiClient.getUrl(`Videos/${this._currentPlayOptions.item.Id}/${this._currentPlayOptions.mediaSource.Id}/Subtitles/${extSubtitle.Index}/stream.${subtitleExt}`, directOptions);
+                } else {
+                    src = extSubtitle.Path;
+                }
+            }
+            
+            if (!src) {
+                console.warn(`No source URL for external subtitle with index ${jfIndex}`);
+                return;
+            }
+
+            console.debug(`Loading external subtitle on demand: ${extSubtitle.DisplayTitle || extSubtitle.Title || 'Unknown'} from ${src}`);
+            
+            await this._avplayer.loadExternalSubtitle({ 
+                source: src, 
+                title: extSubtitle.DisplayTitle || extSubtitle.Title, 
+                lang: extSubtitle.Language || extSubtitle.lang 
+            });
+            
+            // Find the newly added subtitle stream and map it to jf index
+            const streams = this._avplayer.getStreams?.() || [];
+            const newSubtitle = streams
+                .filter((s) => s?.codecparProxy?.codecType === 'AVMEDIA_TYPE_SUBTITLE' || s?.codecpar?.codecType === 3)
+                .find((s) => !seenStreamIds.has(s.id));
+            
+            if (newSubtitle) {
+                this._subtitleIndexToLibId.set(jfIndex, newSubtitle.id);
+                console.debug(`Dynamically loaded and mapped external subtitle jellyfin index ${jfIndex} to libmedia id ${newSubtitle.id}`);
+            } else {
+                console.warn(`Failed to find newly loaded external subtitle for jellyfin index ${jfIndex}`);
+            }
+        } catch (e) {
+            console.error(`Failed to load external subtitle ${extSubtitle.DisplayTitle || jfIndex}:`, e);
+            throw e; // Re-throw to let caller handle it
         }
     }
 
@@ -727,6 +932,8 @@ class LibmediaPlayer {
         tryRemoveElement(this._videoDialog);
         this._videoDialog = null;
         this._container = null;
+        this._subtitleIndexToLibId.clear();
+        this._externalSubtitleInfo.clear();
     }
 
     // Fullscreen helpers for OSD controls
