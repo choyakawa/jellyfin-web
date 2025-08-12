@@ -104,6 +104,8 @@ class LibmediaPlayer {
         this._httpOptions = null;
         // Bound handler for browser back/forward navigation (popstate)
         this._boundPopState = null;
+        // Guard to avoid recursive fallback attempts
+        this._inFallback = false;
     }
 
     canPlayMediaType(mediaType) {
@@ -377,14 +379,19 @@ class LibmediaPlayer {
         }
 
         if (!this._container || !this._container.isConnected) {
-            // Build a fresh container
-            const fresh = document.createElement('div');
-            fresh.classList.add('libmediaPlayer');
-            fresh.style.width = '100%';
-            fresh.style.height = '100%';
-            this._videoDialog.innerHTML = '';
-            this._videoDialog.appendChild(fresh);
-            this._container = fresh;
+            // Reuse and minimally mutate DOM to avoid breaking OSD and bindings
+            const existing = this._videoDialog.querySelector('.libmediaPlayer');
+            if (existing) {
+                this._container = existing;
+                this._container.innerHTML = '';
+            } else {
+                const fresh = document.createElement('div');
+                fresh.classList.add('libmediaPlayer');
+                fresh.style.width = '100%';
+                fresh.style.height = '100%';
+                this._videoDialog.appendChild(fresh);
+                this._container = fresh;
+            }
         } else {
             // Reattach existing container if detached
             if (!document.body.contains(this._container)) {
@@ -602,7 +609,17 @@ class LibmediaPlayer {
         this._avplayer.on?.(ev.STOPPED || 'stopped', () => {
             this._onEndedInternal();
         });
-        this._avplayer.on?.(ev.ERROR || 'error', (err) => {
+        this._avplayer.on?.(ev.ERROR || 'error', async (err) => {
+            try {
+                if (this._prefersMSE && !this._inFallback) {
+                    this._inFallback = true;
+                    const switched = await this._ensureMediaStreamFallback();
+                    this._inFallback = false;
+                    if (switched) return;
+                }
+            } catch (_) {
+                this._inFallback = false;
+            }
             Events.trigger(this, 'error', [err?.message || 'ErrorDefault']);
         });
         this._avplayer.on?.(ev.STREAM_UPDATE || 'streamUpdate', () => {
