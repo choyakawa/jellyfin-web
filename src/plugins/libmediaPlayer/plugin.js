@@ -106,6 +106,12 @@ class LibmediaPlayer {
         this._boundPopState = null;
         // Guard to avoid recursive fallback attempts
         this._inFallback = false;
+        // MediaStream fallback time normalization state
+        this._mediaStreamVideo = null;
+        this._nativeCurrentTimeGet = null;
+        this._nativeCurrentTimeSet = null;
+        this._msClockOffsetSec = 0;
+        this._msClockCalibrated = false;
     }
 
     canPlayMediaType(mediaType) {
@@ -412,6 +418,9 @@ class LibmediaPlayer {
         video.srcObject = mediaStream;
 
         this._container.appendChild(video);
+
+        // Normalize HTMLVideoElement currentTime for MediaStream so it starts from 0s, not a wall-clock timestamp
+        try { this._patchMediaStreamCurrentTime(video); } catch (_) {}
 
         // eslint-disable-next-line no-undef
         this._avplayer = new window.AVPlayer({
@@ -1180,6 +1189,8 @@ class LibmediaPlayer {
             this._clickUnbind = null;
         }
         this._destroyCustomTrack();
+        // Restore any patched currentTime on MediaStream video
+        try { this._unpatchMediaStreamCurrentTime(); } catch {}
         tryRemoveElement(this._videoDialog);
         this._videoDialog = null;
         this._container = null;
@@ -1191,6 +1202,78 @@ class LibmediaPlayer {
                 document.webkitCancelFullscreen();
             }
         } catch {}
+    }
+
+    // ---- MediaStream currentTime normalization ----
+    _patchMediaStreamCurrentTime(videoEl) {
+        // Already patched
+        if (!videoEl || this._mediaStreamVideo === videoEl) return;
+        this._mediaStreamVideo = videoEl;
+        const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
+        if (!desc || typeof desc.get !== 'function' || typeof desc.set !== 'function') return;
+        this._nativeCurrentTimeGet = desc.get;
+        this._nativeCurrentTimeSet = desc.set;
+        this._msClockCalibrated = false;
+        this._msClockOffsetSec = 0;
+
+        // Calibrate offset against libmedia clock
+        const calibrate = () => {
+            try {
+                const raw = Number(this._nativeCurrentTimeGet.call(videoEl) || 0);
+                const expected = (() => { try { return Number(this._avplayer?.currentTime || 0n) / 1000; } catch { return 0; } })();
+                // Only calibrate when the stream has started and raw clearly deviates from expected
+                const diff = raw - expected;
+                // If diff looks like a wall-clock value (e.g., seconds since epoch), or we've not calibrated yet, set/adjust offset
+                if (!this._msClockCalibrated || Math.abs(diff - this._msClockOffsetSec) > 2) {
+                    this._msClockOffsetSec = diff;
+                    this._msClockCalibrated = true;
+                }
+            } catch {}
+        };
+
+        // Replace currentTime accessor on this instance only
+        Object.defineProperty(videoEl, 'currentTime', {
+            configurable: true,
+            enumerable: false,
+            get: () => {
+                // Keep calibration lightweight and resilient
+                calibrate();
+                const raw = Number(this._nativeCurrentTimeGet.call(videoEl) || 0);
+                const corrected = raw - (this._msClockOffsetSec || 0);
+                return Number.isFinite(corrected) ? corrected : 0;
+            },
+            set: (val) => {
+                const v = Number(val) || 0;
+                // Map desired timeline time to raw timeline
+                const rawTarget = v + (this._msClockOffsetSec || 0);
+                try { this._nativeCurrentTimeSet.call(videoEl, rawTarget); } catch {}
+            }
+        });
+
+        // Also recalibrate on key playback events
+        const onPlay = () => calibrate();
+        const onTime = () => calibrate();
+        try {
+            videoEl.addEventListener('playing', onPlay);
+            videoEl.addEventListener('timeupdate', onTime);
+        } catch {}
+        this._unpatchBind = () => {
+            try { videoEl.removeEventListener('playing', onPlay); } catch {}
+            try { videoEl.removeEventListener('timeupdate', onTime); } catch {}
+            try { delete videoEl.currentTime; } catch {}
+        };
+    }
+
+    _unpatchMediaStreamCurrentTime() {
+        const videoEl = this._mediaStreamVideo;
+        if (!videoEl) return;
+        try { this._unpatchBind?.(); } catch {}
+        this._mediaStreamVideo = null;
+        this._nativeCurrentTimeGet = null;
+        this._nativeCurrentTimeSet = null;
+        this._msClockCalibrated = false;
+        this._msClockOffsetSec = 0;
+        this._unpatchBind = null;
     }
 
     // ----- Jellyfin subtitle rendering (client-side) -----
