@@ -116,6 +116,13 @@ class LibmediaPlayer {
         this._ghostVideo = null;
         this._ghostUnpatch = null;
         this._pgsCustomCanvas = null;
+        // External audio state
+        this._externalAudioActive = false;
+        this._extAudioSelectedIndex = null;
+        this._extAudioElement = null;
+        this._extAudioStream = null;
+        this._extAudioPlayer = null;
+        this._mutedMainDueToExternal = false;
     }
 
     canPlayMediaType(mediaType) {
@@ -640,7 +647,16 @@ class LibmediaPlayer {
                 if (s.Type !== 'Subtitle') continue;
                 let url = s.DeliveryUrl || '';
                 if (!url || url.startsWith('/')) {
-                    const ext = (s.Codec || 'vtt').toLowerCase();
+                    // Use the extension from s.Path, fallback to Codec
+                    let ext = 'vtt'; // default fallback
+                    if (s.Path) {
+                        const pathParts = s.Path.split('.');
+                        if (pathParts.length > 1) {
+                            ext = pathParts[pathParts.length - 1].toLowerCase();
+                        }
+                    } else {
+                        ext = (s.Codec || 'vtt').toLowerCase();
+                    }
                     const path = `Videos/${item.Id}/${mediaSource.Id}/Subtitles/${s.Index}/stream.${ext}`;
                     url = apiClient.getUrl(path, directOptions);
                     s.DeliveryUrl = url;
@@ -661,6 +677,8 @@ class LibmediaPlayer {
                 const timeMs = Number(this._avplayer?.currentTime || 0n);
                 this._updateSubtitleText(timeMs);
             } catch {}
+            // keep external audio synced to main clock
+            try { this._syncExternalAudioTime(); } catch {}
             Events.trigger(this, 'timeupdate');
         });
         this._avplayer.on?.(ev.PAUSED || 'paused', () => {
@@ -790,6 +808,7 @@ class LibmediaPlayer {
             // Convert jellyfin ticks to milliseconds bigint
             const ms = BigInt(Math.floor((ticks || 0) / 10000));
             await this._avplayer.seek(ms);
+            try { await this._extAudioPlayer?.seek?.(ms); } catch {}
         } catch (err) {
             console.error('Seek failed:', err);
             throw err;
@@ -797,6 +816,7 @@ class LibmediaPlayer {
     }
 
     pause() {
+        try { this._extAudioPlayer?.pause?.(); } catch {}
         return this._avplayer?.pause();
     }
 
@@ -805,6 +825,7 @@ class LibmediaPlayer {
     }
 
     unpause() {
+        try { this._extAudioPlayer?.play?.(); } catch {}
         return this._avplayer?.play();
     }
 
@@ -830,7 +851,12 @@ class LibmediaPlayer {
         const clamped = Math.max(0, Math.min(100, Number(val) || 0));
         this._volume = clamped;
         htmlMediaHelper.saveVolume(clamped / 100);
-        if (this._avplayer?.setVolume) {
+        if (this._externalAudioActive) {
+            if (this._extAudioElement) {
+                try { this._extAudioElement.volume = clamped / 100; } catch {}
+            }
+            try { this._avplayer?.setVolume?.(0, true); } catch {}
+        } else if (this._avplayer?.setVolume) {
             this._avplayer.setVolume(clamped / 100, true);
         }
         Events.trigger(this, 'volumechange');
@@ -897,6 +923,20 @@ class LibmediaPlayer {
         if (!this._avplayer?.selectAudio) return;
         
         try {
+            // External audio stream (m4a/mka etc.) handled via auxiliary libmedia in MediaStream mode
+            const mediaSource = this._currentPlayOptions?.mediaSource;
+            const item = this._currentPlayOptions?.item;
+            const jfStream = (mediaSource?.MediaStreams || []).find((s) => s.Type === 'Audio' && s.Index === index);
+            if (jfStream?.IsExternal) {
+                await this._activateExternalAudioForStream(jfStream, item, mediaSource);
+                this._extAudioSelectedIndex = index;
+                return;
+            } else {
+                // switching back to internal
+                this._deactivateExternalAudio();
+                this._extAudioSelectedIndex = null;
+            }
+
             const libId = this._mapJellyfinStreamIndexToLibId(index, 'audio');
             if (libId == null) {
                 console.warn(`Failed to map jellyfin audio stream index ${index} to libmedia id`);
@@ -1168,6 +1208,7 @@ class LibmediaPlayer {
 
     setPlaybackRate(rate) {
         try { this._avplayer?.setPlaybackRate?.(Number(rate)); } catch {}
+        try { this._extAudioPlayer?.setPlaybackRate?.(Number(rate)); } catch {}
     }
 
     getPlaybackRate() {
@@ -1739,3 +1780,140 @@ function normalizeTrackEventText(text, useHtml) {
         .split('\n').map(val => `\u200E${val}`).join('\n');
     return useHtml ? result.replace(/\n/gi, '<br>') : result;
 }
+
+// ---------------------
+// External audio helpers (prototype methods)
+// ---------------------
+LibmediaPlayer.prototype._computeExternalAudioUrl = function (track, item, mediaSource) {
+    try {
+        if (!track || !item || !mediaSource) return '';
+        let delivery = track.DeliveryUrl;
+        const apiClient = ServerConnections.getApiClient(item.ServerId);
+        const directOptions = {
+            Static: true,
+            mediaSourceId: mediaSource.Id,
+            deviceId: apiClient.deviceId(),
+            ApiKey: apiClient.accessToken()
+        };
+        if (mediaSource.ETag) directOptions.Tag = mediaSource.ETag;
+        if (mediaSource.LiveStreamId) directOptions.LiveStreamId = mediaSource.LiveStreamId;
+        if (!delivery || delivery.startsWith('/')) {
+            // Use the extension from track.Path, fallback to Container/Codec
+            let ext = 'aac'; // default fallback
+            if (track.Path) {
+                const pathParts = track.Path.split('.');
+                if (pathParts.length > 1) {
+                    ext = pathParts[pathParts.length - 1].toLowerCase();
+                }
+            } else {
+                ext = (track.Container || track.Codec || 'aac').toLowerCase();
+            }
+            const path = `Videos/${item.Id}/${mediaSource.Id}/Audios/${track.Index}/stream.${ext}`;
+            delivery = apiClient.getUrl(path, directOptions);
+        }
+        return delivery;
+    } catch { return ''; }
+};
+
+LibmediaPlayer.prototype._activateExternalAudioForStream = async function (track, item, mediaSource) {
+    try {
+        if (this._externalAudioActive && this._extAudioSelectedIndex === track?.Index) return;
+        this._deactivateExternalAudio();
+        const url = this._computeExternalAudioUrl(track, item, mediaSource);
+        if (!url) throw new Error('External audio url not available');
+
+        // Create hidden audio element bound to MediaStream
+        const audioStream = new MediaStream();
+        const audioElem = document.createElement('audio');
+        audioElem.autoplay = true;
+        audioElem.controls = false;
+        audioElem.muted = false;
+        audioElem.playsInline = true;
+        audioElem.webkitPlaysInline = true;
+        audioElem.style.position = 'absolute';
+        audioElem.style.inset = '0';
+        audioElem.style.opacity = '0';
+        audioElem.style.pointerEvents = 'none';
+        audioElem.srcObject = audioStream;
+        (this._videoDialog || document.body).appendChild(audioElem);
+
+        const wasmCdn = this._wasmBaseUrl || 'https://cdn.jsdelivr.net/gh/zhaohappy/libmedia@latest/dist';
+        // eslint-disable-next-line no-undef
+        const aux = new window.AVPlayer({
+            container: audioStream,
+            enableHardware: true,
+            enableWebCodecs: true,
+            enableWebGPU: false,
+            enableWorker: true,
+            wasmBaseUrl: `${wasmCdn}`,
+            http: this._httpOptions,
+            checkUseMES: () => false,
+            getWasm: (type, codecId) => {
+                const suffix = '';
+                if (type === 'decoder') {
+                    switch (codecId) {
+                        case 86017: return `${wasmCdn}/decode/mp3${suffix}.wasm`;
+                        case 86018: return `${wasmCdn}/decode/aac${suffix}.wasm`;
+                        case 86019: return `${wasmCdn}/decode/ac3${suffix}.wasm`;
+                        case 86020: return `${wasmCdn}/decode/dca${suffix}.wasm`;
+                        case 86021: return `${wasmCdn}/decode/vorbis${suffix}.wasm`;
+                        case 86024: return `${wasmCdn}/decode/wma${suffix}.wasm`;
+                        case 86028: return `${wasmCdn}/decode/flac${suffix}.wasm`;
+                        case 86051: return `${wasmCdn}/decode/speex${suffix}.wasm`;
+                        case 86056: return `${wasmCdn}/decode/eac3${suffix}.wasm`;
+                        case 86076: return `${wasmCdn}/decode/opus${suffix}.wasm`;
+                        default: return null;
+                    }
+                } else if (type === 'resampler') {
+                    return `${wasmCdn}/resample/resample${suffix}.wasm`;
+                } else if (type === 'stretchpitcher') {
+                    return `${wasmCdn}/stretchpitch/stretchpitch${suffix}.wasm`;
+                }
+                return null;
+            }
+        });
+
+        await aux.load(url);
+        await aux.play();
+
+        try { this._avplayer?.setVolume?.(0, true); this._mutedMainDueToExternal = true; } catch {}
+        try { audioElem.volume = (this._volume || 100) / 100; } catch {}
+
+        this._extAudioElement = audioElem;
+        this._extAudioStream = audioStream;
+        this._extAudioPlayer = aux;
+        this._externalAudioActive = true;
+        this._extAudioSelectedIndex = track?.Index ?? null;
+        try { const r = this.getPlaybackRate?.() ?? 1; aux.setPlaybackRate?.(Number(r)); } catch {}
+    } catch (err) {
+        console.warn('Failed to activate external audio:', err);
+        this._deactivateExternalAudio();
+    }
+};
+
+LibmediaPlayer.prototype._deactivateExternalAudio = function () {
+    try { this._extAudioPlayer?.stop?.(); } catch {}
+    try { this._extAudioPlayer?.destroy?.(); } catch {}
+    this._extAudioPlayer = null;
+    this._extAudioStream = null;
+    if (this._extAudioElement) { tryRemoveElement(this._extAudioElement); }
+    this._extAudioElement = null;
+    if (this._mutedMainDueToExternal) {
+        try { this._avplayer?.setVolume?.((this._volume || 0) / 100, true); } catch {}
+        this._mutedMainDueToExternal = false;
+    }
+    this._externalAudioActive = false;
+    this._extAudioSelectedIndex = null;
+};
+
+LibmediaPlayer.prototype._syncExternalAudioTime = function () {
+    if (!this._externalAudioActive || !this._extAudioPlayer || !this._avplayer) return;
+    try {
+        const mainMs = Number(this._avplayer.currentTime || 0n);
+        const auxMs = Number(this._extAudioPlayer.currentTime || 0n);
+        const drift = (auxMs - mainMs) / 1000;
+        if (Math.abs(drift) > 0.15) {
+            this._extAudioPlayer.seek?.(BigInt(mainMs));
+        }
+    } catch {}
+};
