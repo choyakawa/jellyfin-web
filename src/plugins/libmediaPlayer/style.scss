@@ -36,6 +36,17 @@
   background: transparent !important;
 }
 
+/* Ghost video for canvas path (invisible, behind everything) */
+.libmedia-ghost-video {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+
 /* Subtitle container styles (reuse from htmlVideoPlayer) */
 .videoSubtitles {
   position: fixed;

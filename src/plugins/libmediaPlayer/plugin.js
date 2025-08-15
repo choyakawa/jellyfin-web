@@ -112,6 +112,10 @@ class LibmediaPlayer {
         this._nativeCurrentTimeSet = null;
         this._msClockOffsetSec = 0;
         this._msClockCalibrated = false;
+        // Ghost/invisible helpers for subtitle rendering on canvas path
+        this._ghostVideo = null;
+        this._ghostUnpatch = null;
+        this._pgsCustomCanvas = null;
     }
 
     canPlayMediaType(mediaType) {
@@ -198,6 +202,8 @@ class LibmediaPlayer {
             }
             this._videoDialog = dlg;
             this._container = dlg.querySelector('.libmediaPlayer') || dlg;
+            // Ensure previous libmedia surfaces are cleared to avoid duplicate <video> when reusing container
+            try { this._container.innerHTML = ''; } catch {}
         }
 
         const includeCorsCredentials = await getIncludeCorsCredentials();
@@ -211,7 +217,7 @@ class LibmediaPlayer {
             container: this._container,
             enableHardware: true,
             enableWebCodecs: true,
-            enableWebGPU: true,
+            enableWebGPU: false,
             enableWorker: true,
             wasmBaseUrl: `${wasmCdn}`,
             http: httpOptions,
@@ -277,7 +283,13 @@ class LibmediaPlayer {
                     await this._switchToMediaStreamMode(url, wasmCdn, httpOptions);
                 } catch (fallbackErr) {
                     console.error('[LibmediaPlayer] MediaStream fallback failed:', fallbackErr);
-                    throw primaryErr;
+                    // Final fallback: force canvas pipeline (no MSE / no MediaStream)
+                    try {
+                        await this._forceCanvasFallback(url, wasmCdn, httpOptions);
+                    } catch (canvasErr) {
+                        console.error('[LibmediaPlayer] Canvas fallback failed:', canvasErr);
+                        throw primaryErr;
+                    }
                 }
             }
 
@@ -358,13 +370,7 @@ class LibmediaPlayer {
             throw err;
         }
 
-        // Ensure player is torn down on browser back/forward even if OSD handlers didn't run
-        if (!this._boundPopState) {
-            this._boundPopState = () => {
-                try { this.stop(true); } catch { /* ignore */ }
-            };
-            window.addEventListener('popstate', this._boundPopState);
-        }
+        // Do not auto-tear down on browser navigation; let OSD/router manage lifecycle
     }
 
     async _switchToMediaStreamMode(url, wasmCdn, httpOptions) {
@@ -417,6 +423,8 @@ class LibmediaPlayer {
         video.style.height = '100%';
         video.srcObject = mediaStream;
 
+        // Mark as libmedia-managed video for future safe cleanup
+        try { video.classList.add('avplayer-video'); } catch {}
         this._container.appendChild(video);
 
         // Normalize HTMLVideoElement currentTime for MediaStream so it starts from 0s, not a wall-clock timestamp
@@ -427,7 +435,7 @@ class LibmediaPlayer {
             container: mediaStream,
             enableHardware: true,
             enableWebCodecs: true,
-            enableWebGPU: true,
+            enableWebGPU: false,
             enableWorker: true,
             wasmBaseUrl: `${wasmCdn}`,
             http: httpOptions,
@@ -486,6 +494,82 @@ class LibmediaPlayer {
         try { await this._avplayer.play(); } catch {}
         try { this._reapplySubtitlesAfterPipelineChange(); } catch {}
         return true;
+    }
+
+    async _forceCanvasFallback(url, wasmCdn, httpOptions) {
+        // Clean current player instance if any
+        try { await this._avplayer?.destroy?.(); } catch {}
+        this._avplayer = null;
+
+        // Ensure container exists
+        if (!this._container || !this._container.isConnected) {
+            const existing = this._videoDialog?.querySelector?.('.libmediaPlayer');
+            if (existing) {
+                this._container = existing;
+                this._container.innerHTML = '';
+            } else {
+                const fresh = document.createElement('div');
+                fresh.classList.add('libmediaPlayer');
+                fresh.style.width = '100%';
+                fresh.style.height = '100%';
+                this._videoDialog?.appendChild?.(fresh);
+                this._container = fresh;
+            }
+        } else {
+            this._container.innerHTML = '';
+        }
+
+        // eslint-disable-next-line no-undef
+        this._avplayer = new window.AVPlayer({
+            container: this._container,
+            enableHardware: true,
+            enableWebCodecs: true,
+            enableWebGPU: false,
+            enableWorker: true,
+            wasmBaseUrl: `${wasmCdn}`,
+            http: httpOptions,
+            checkUseMES: () => false,
+            getWasm: (type, codecId) => {
+                const suffix = '';
+                if (type === 'decoder') {
+                    switch (codecId) {
+                        case 2: return `${wasmCdn}/decode/mpeg2video${suffix}.wasm`;
+                        case 12: return `${wasmCdn}/decode/mpeg4${suffix}.wasm`;
+                        case 27: return `${wasmCdn}/decode/h264${suffix}.wasm`;
+                        case 30: return `${wasmCdn}/decode/theora${suffix}.wasm`;
+                        case 139: return `${wasmCdn}/decode/vp8${suffix}.wasm`;
+                        case 167: return `${wasmCdn}/decode/vp9${suffix}.wasm`;
+                        case 173: return `${wasmCdn}/decode/hevc${suffix}.wasm`;
+                        case 196: return `${wasmCdn}/decode/vvc${suffix}.wasm`;
+                        case 225: return `${wasmCdn}/decode/av1${suffix}.wasm`;
+                        case 86017: return `${wasmCdn}/decode/mp3${suffix}.wasm`;
+                        case 86018: return `${wasmCdn}/decode/aac${suffix}.wasm`;
+                        case 86019: return `${wasmCdn}/decode/ac3${suffix}.wasm`;
+                        case 86020: return `${wasmCdn}/decode/dca${suffix}.wasm`;
+                        case 86021: return `${wasmCdn}/decode/vorbis${suffix}.wasm`;
+                        case 86022: return `${wasmCdn}/decode/dvaudio${suffix}.wasm`;
+                        case 86024: return `${wasmCdn}/decode/wma${suffix}.wasm`;
+                        case 86028: return `${wasmCdn}/decode/flac${suffix}.wasm`;
+                        case 86051: return `${wasmCdn}/decode/speex${suffix}.wasm`;
+                        case 86056: return `${wasmCdn}/decode/eac3${suffix}.wasm`;
+                        case 86076: return `${wasmCdn}/decode/opus${suffix}.wasm`;
+                        case 7: return `${wasmCdn}/decode/mjpeg${suffix}.wasm`;
+                        default: return null;
+                    }
+                } else if (type === 'resampler') {
+                    return `${wasmCdn}/resample/resample${suffix}.wasm`;
+                } else if (type === 'stretchpitcher') {
+                    return `${wasmCdn}/stretchpitch/stretchpitch${suffix}.wasm`;
+                }
+                return null;
+            }
+        });
+
+        this._bindEvents();
+        await this._avplayer.load(url);
+        this._prefersMSE = false;
+        try { await this._avplayer.play(); } catch {}
+        try { this._reapplySubtitlesAfterPipelineChange(); } catch {}
     }
 
     _reapplySubtitlesAfterPipelineChange() {
@@ -602,10 +686,8 @@ class LibmediaPlayer {
         this._avplayer.on?.(ev.LOADING || 'loading', () => {
             Events.trigger(this, 'waiting');
         });
-        this._avplayer.on?.(ev.LOADED || 'loaded', () => {
-            // signal ready state; htmlVideoPlayer uses 'playing', but LOADED can occur earlier
-            Events.trigger(this, 'playing');
-        });
+        // Avoid early 'playing' on LOADED to prevent OSD state machine from restarting playback
+        this._avplayer.on?.(ev.LOADED || 'loaded', () => {});
         this._avplayer.on?.(ev.SEEKING || 'seeking', () => {
             Events.trigger(this, 'waiting');
         });
@@ -850,21 +932,18 @@ class LibmediaPlayer {
     }
 
     setSubtitleStreamIndex(index) {
-        // Jellyfin-rendered subtitles only
+        // Jellyfin-rendered subtitles only. Allow rendering even without <video> (will fallback to custom element)
         const video = this._getVideoElement();
-        if (!video) {
-            console.warn('No video element available for subtitle rendering');
-            return;
-        }
-
         const mediaSource = this._currentPlayOptions?.mediaSource;
         const item = this._currentPlayOptions?.item;
         if (!mediaSource || !item) return;
 
-        // destroy when disabled
+        // destroy when disabled (do not touch player instance)
         if (index == null || index === -1) {
             this._customTrackIndex = -1;
             this._destroyCustomTrack(0); // destroy primary
+            // notify UI that only subtitle state changed
+            Events.trigger(this, 'mediastreamschange');
             return;
         }
 
@@ -1189,6 +1268,8 @@ class LibmediaPlayer {
             this._clickUnbind = null;
         }
         this._destroyCustomTrack();
+        this._destroyGhostVideoElement();
+        if (this._pgsCustomCanvas) { tryRemoveElement(this._pgsCustomCanvas); this._pgsCustomCanvas = null; }
         // Restore any patched currentTime on MediaStream video
         try { this._unpatchMediaStreamCurrentTime(); } catch {}
         tryRemoveElement(this._videoDialog);
@@ -1274,6 +1355,62 @@ class LibmediaPlayer {
         this._msClockCalibrated = false;
         this._msClockOffsetSec = 0;
         this._unpatchBind = null;
+    }
+
+    // ----- Ghost video for canvas path to drive libass/libpgs -----
+    _ensureGhostVideoElement() {
+        if (this._ghostVideo && document.body.contains(this._ghostVideo)) return this._ghostVideo;
+        const host = this._videoDialog || document.body;
+        if (!host) throw new Error('No host for ghost video');
+        const ghost = document.createElement('video');
+        ghost.classList.add('libmedia-ghost-video');
+        ghost.playsInline = true;
+        ghost.webkitPlaysInline = true;
+        ghost.muted = true;
+        ghost.autoplay = false;
+        ghost.controls = false;
+        ghost.style.position = 'absolute';
+        ghost.style.inset = '0';
+        ghost.style.width = '100%';
+        ghost.style.height = '100%';
+        ghost.style.opacity = '0';
+        ghost.style.pointerEvents = 'none';
+        ghost.style.zIndex = '0';
+        host.appendChild(ghost);
+
+        // Patch currentTime getter to reflect avplayer clock (seconds)
+        const self = this;
+        const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
+        try {
+            Object.defineProperty(ghost, 'currentTime', {
+                configurable: true,
+                enumerable: false,
+                get() {
+                    try { return Number(self._avplayer?.currentTime || 0n) / 1000; } catch { return 0; }
+                },
+                set(val) {
+                    const ms = BigInt(Math.floor(Number(val || 0) * 1000));
+                    try { self._avplayer?.seek?.(ms); } catch {}
+                }
+            });
+        } catch (_) {
+            // ignore
+        }
+
+        this._ghostVideo = ghost;
+        this._ghostUnpatch = () => {
+            try { if (desc) Object.defineProperty(ghost, 'currentTime', desc); } catch {}
+        };
+        return ghost;
+    }
+
+    _destroyGhostVideoElement() {
+        try { this._ghostUnpatch?.(); } catch {}
+        this._ghostUnpatch = null;
+        if (this._ghostVideo) {
+            tryRemoveElement(this._ghostVideo);
+        }
+        this._ghostVideo = null;
     }
 
     // ----- Jellyfin subtitle rendering (client-side) -----
@@ -1376,10 +1513,14 @@ class LibmediaPlayer {
     }
 
     async _renderSsaAss(videoElement, track, item) {
-        // If no HTMLVideoElement (e.g. canvas path), fallback to custom element
+        // If no HTMLVideoElement (e.g. canvas path), create a ghost video to drive libass
         if (!videoElement) {
-            await this._renderSubtitlesWithCustomElement(null, track, item, PRIMARY_TEXT_TRACK_INDEX);
-            return;
+            try {
+                videoElement = this._ensureGhostVideoElement();
+            } catch (_) {
+                await this._renderSubtitlesWithCustomElement(null, track, item, PRIMARY_TEXT_TRACK_INDEX);
+                return;
+            }
         }
         const supportedFonts = ['application/vnd.ms-opentype', 'application/x-truetype-font', 'font/otf', 'font/ttf', 'font/woff', 'font/woff2'];
         const availableFonts = [];
@@ -1433,9 +1574,36 @@ class LibmediaPlayer {
 
     async _renderPgs(videoElement, track, item) {
         const libpgs = await import('libpgs');
+        // Ensure video/canvas target
+        let targetVideo = videoElement;
+        if (!targetVideo) {
+            try {
+                targetVideo = this._ensureGhostVideoElement();
+            } catch (e) {
+                // fallback to canvas overlay if ghost video cannot be created
+                const canvas = document.createElement('canvas');
+                canvas.style.position = 'absolute';
+                canvas.style.inset = '0';
+                canvas.style.width = '100%';
+                canvas.style.height = '100%';
+                canvas.style.pointerEvents = 'none';
+                this._container?.appendChild(canvas);
+                this._pgsCustomCanvas = canvas;
+                const aspectRatio = this.getAspectRatio() === 'auto' ? 'contain' : this.getAspectRatio();
+                const options = {
+                    canvas,
+                    subUrl: this._getTextTrackUrl(track, item),
+                    workerUrl: `${appRouter.baseUrl()}/libraries/libpgs.worker.js`,
+                    timeOffset: (this._currentPlayOptions?.transcodingOffsetTicks || 0) / 10000000,
+                    aspectRatio
+                };
+                this._currentPgsRenderer = new libpgs.PgsRenderer(options);
+                return;
+            }
+        }
         const aspectRatio = this.getAspectRatio() === 'auto' ? 'contain' : this.getAspectRatio();
         const options = {
-            video: videoElement,
+            video: targetVideo,
             subUrl: this._getTextTrackUrl(track, item),
             workerUrl: `${appRouter.baseUrl()}/libraries/libpgs.worker.js`,
             timeOffset: (this._currentPlayOptions?.transcodingOffsetTicks || 0) / 10000000,
