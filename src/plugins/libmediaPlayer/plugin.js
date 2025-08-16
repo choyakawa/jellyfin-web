@@ -123,6 +123,12 @@ class LibmediaPlayer {
         this._extAudioStream = null;
         this._extAudioPlayer = null;
         this._mutedMainDueToExternal = false;
+        // Sync guards
+        this._mainSeekInProgress = false;
+        this._extAudioSeekInProgress = false;
+        this._extAudioLastResyncTs = 0;
+        this._extAudioPrimed = false;
+        this._extAudioStreamIndex = -1;
     }
 
     canPlayMediaType(mediaType) {
@@ -487,6 +493,8 @@ class LibmediaPlayer {
         this._bindEvents();
         await this._avplayer.load(url);
         this._prefersMSE = false;
+        // Ensure ghost video exists for canvas path before any external audio might attach
+        try { this._ensureGhostVideoElement(); } catch {}
         try { await this._avplayer.play(); } catch {}
         try { this._reapplySubtitlesAfterPipelineChange(); } catch {}
     }
@@ -707,9 +715,11 @@ class LibmediaPlayer {
         // Avoid early 'playing' on LOADED to prevent OSD state machine from restarting playback
         this._avplayer.on?.(ev.LOADED || 'loaded', () => {});
         this._avplayer.on?.(ev.SEEKING || 'seeking', () => {
+            this._mainSeekInProgress = true;
             Events.trigger(this, 'waiting');
         });
         this._avplayer.on?.(ev.SEEKED || 'seeked', () => {
+            this._mainSeekInProgress = false;
             Events.trigger(this, 'playing');
         });
         this._avplayer.on?.(ev.ENDED || 'ended', () => {
@@ -1398,6 +1408,30 @@ class LibmediaPlayer {
         this._unpatchBind = null;
     }
 
+    // Normalize HTMLAudioElement currentTime for aux MediaStream to reflect aux libmedia clock
+    _patchAuxAudioElementCurrentTime(audioEl) {
+        if (!audioEl) return;
+        try {
+            const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
+            const self = this;
+            Object.defineProperty(audioEl, 'currentTime', {
+                configurable: true,
+                enumerable: false,
+                get() {
+                    try { return Number(self._extAudioPlayer?.currentTime || 0n) / 1000; } catch { return 0; }
+                },
+                set(val) {
+                    try {
+                        const targetMs = Math.max(0, Math.floor(Number(val || 0) * 1000));
+                        self._extAudioPlayer?.seek?.(BigInt(targetMs));
+                    } catch {}
+                }
+            });
+            // store unpatcher
+            audioEl.__auxUnpatch = () => { try { if (desc) Object.defineProperty(audioEl, 'currentTime', desc); } catch {} };
+        } catch {}
+    }
+
     // ----- Ghost video for canvas path to drive libass/libpgs -----
     _ensureGhostVideoElement() {
         if (this._ghostVideo && document.body.contains(this._ghostVideo)) return this._ghostVideo;
@@ -1521,9 +1555,17 @@ class LibmediaPlayer {
     }
 
     _getTextTrackUrl(track, item, format) {
-        // prefer DeliveryUrl if exists (and we previously ensured absolute in _ensureSubtitleDeliveryUrls)
-        let url = track.DeliveryUrl || playbackManager.getSubtitleUrl(track, item.ServerId);
-        if (format) url = url.replace('.vtt', format);
+        // Always derive from Jellyfin helper to ensure server produces the correct JSON endpoint (.js)
+        // Avoid using DeliveryUrl directly, which may point to raw .srt/.ass files
+        let url = playbackManager.getSubtitleUrl(track, item.ServerId);
+        if (format) {
+            // Replace terminal extension (default .vtt) with desired format, preserving query string
+            url = url.replace(/\.(vtt|srt|ass|ssa|pgssub|sub)(?=($|\?))/i, format);
+            if (!/\.(js|vtt|srt|ass|ssa|pgssub|sub)(?=($|\?))/i.test(url)) {
+                const qsIndex = url.indexOf('?');
+                url = qsIndex >= 0 ? `${url.slice(0, qsIndex)}${format}${url.slice(qsIndex)}` : `${url}${format}`;
+            }
+        }
         return url;
     }
 
@@ -1822,6 +1864,9 @@ LibmediaPlayer.prototype._activateExternalAudioForStream = async function (track
         const url = this._computeExternalAudioUrl(track, item, mediaSource);
         if (!url) throw new Error('External audio url not available');
 
+        // Ensure a ghost video exists as the master clock for any canvas path
+        try { this._ensureGhostVideoElement(); } catch {}
+
         // Create hidden audio element bound to MediaStream
         const audioStream = new MediaStream();
         const audioElem = document.createElement('audio');
@@ -1836,6 +1881,8 @@ LibmediaPlayer.prototype._activateExternalAudioForStream = async function (track
         audioElem.style.pointerEvents = 'none';
         audioElem.srcObject = audioStream;
         (this._videoDialog || document.body).appendChild(audioElem);
+        // Patch audio currentTime to proxy aux libmedia clock (for debugging and external queries)
+        try { this._patchAuxAudioElementCurrentTime(audioElem); } catch {}
 
         const wasmCdn = this._wasmBaseUrl || 'https://cdn.jsdelivr.net/gh/zhaohappy/libmedia@latest/dist';
         // eslint-disable-next-line no-undef
@@ -1873,8 +1920,36 @@ LibmediaPlayer.prototype._activateExternalAudioForStream = async function (track
             }
         });
 
+        // Reset sync flags and bind aux events to guard resync logic
+        try {
+            const ev = window.AVPlayer?.eventType || {};
+            this._extAudioPrimed = false;
+            this._extAudioSeekInProgress = false;
+            this._extAudioLastResyncTs = 0;
+            this._extAudioStreamIndex = -1; // Track the audio stream index for correct seeking
+            
+            aux.on?.(ev.SEEKING || 'seeking', () => { this._extAudioSeekInProgress = true; });
+            aux.on?.(ev.SEEKED || 'seeked', () => { this._extAudioSeekInProgress = false; this._extAudioLastResyncTs = performance.now ? performance.now() : Date.now(); });
+            aux.on?.(ev.LOADED || 'loaded', () => {
+                // Get the audio stream index after loading for correct seeking
+                try {
+                    const streams = aux.getStreams?.() || [];
+                    const audioStream = streams.find(s => s.codecpar?.codecType === 1); // AVMEDIA_TYPE_AUDIO = 1
+                    if (audioStream) {
+                        this._extAudioStreamIndex = audioStream.index;
+                    }
+                } catch {}
+            });
+            aux.on?.(ev.PLAYING || 'playing', () => {
+                this._extAudioPrimed = true;
+                // Apply current playback rate but avoid immediate seek on first play
+                try { const r = this.getPlaybackRate?.() ?? 1; aux.setPlaybackRate?.(Number(r)); } catch {}
+                this._extAudioLastResyncTs = performance.now ? performance.now() : Date.now();
+            });
+        } catch {}
+
         await aux.load(url);
-        await aux.play();
+        try { await aux.play(); } catch {}
 
         try { this._avplayer?.setVolume?.(0, true); this._mutedMainDueToExternal = true; } catch {}
         try { audioElem.volume = (this._volume || 100) / 100; } catch {}
@@ -1909,11 +1984,27 @@ LibmediaPlayer.prototype._deactivateExternalAudio = function () {
 LibmediaPlayer.prototype._syncExternalAudioTime = function () {
     if (!this._externalAudioActive || !this._extAudioPlayer || !this._avplayer) return;
     try {
+        // If seek is ongoing (main or aux), defer resync to avoid chase oscillation
+        if (this._mainSeekInProgress || this._extAudioSeekInProgress || !this._extAudioPrimed) return;
         const mainMs = Number(this._avplayer.currentTime || 0n);
         const auxMs = Number(this._extAudioPlayer.currentTime || 0n);
         const drift = (auxMs - mainMs) / 1000;
-        if (Math.abs(drift) > 0.15) {
-            this._extAudioPlayer.seek?.(BigInt(mainMs));
+        const now = performance.now ? performance.now() : Date.now();
+        // Rate-limit resyncs to avoid rapid reseek loops
+        if (this._extAudioLastResyncTs && (now - this._extAudioLastResyncTs) < 500) return;
+        // Only sync if drift is significant and we have the correct stream index
+        if (Math.abs(drift) > 0.2 && this._extAudioStreamIndex >= 0) {
+            this._extAudioSeekInProgress = true;
+            // Use doSeek with correct streamIndex and AVSeekFlags.FRAME for frame-accurate seeking
+            try {
+                const targetMs = Math.max(0, mainMs);
+                // Call doSeek directly with streamIndex - this is the correct way for libmedia
+                this._extAudioPlayer.doSeek?.(BigInt(targetMs), this._extAudioStreamIndex);
+            } catch {
+                // Fallback to simple seek if doSeek is not available
+                this._extAudioPlayer.seek?.(BigInt(Math.max(0, mainMs)));
+            }
+            this._extAudioLastResyncTs = now;
         }
     } catch {}
 };
