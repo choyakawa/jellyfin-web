@@ -1325,6 +1325,12 @@ export class PlaybackManager {
                 return player.setAudioStreamIndex(index);
             }
 
+            if (player?.supportsClientSideAudioStreamSelection && player.canSetAudioStreamIndex()) {
+                const result = player.setAudioStreamIndex(index);
+                getPlayerData(player).audioStreamIndex = index;
+                return result;
+            }
+
             if (self.playMethod(player) === 'Transcode' || !player.canSetAudioStreamIndex()) {
                 changeStream(player, getCurrentTicks(player), { AudioStreamIndex: index });
                 getPlayerData(player).audioStreamIndex = index;

@@ -247,6 +247,7 @@ class LibmediaPlayer {
         this.syncPlayWrapAs = 'htmlvideoplayer';
         // Take priority over HTML players (which default to 1)
         this.priority = 0;
+        this.supportsClientSideAudioStreamSelection = true;
         // Let playbackmanager expand DeliveryUrl to absolute
         this.useFullSubtitleUrls = true;
         this.isLocalPlayer = true;
@@ -284,6 +285,7 @@ class LibmediaPlayer {
         // External audio state
         this._externalAudioActive = false;
         this._extAudioSelectedIndex = null;
+        this._selectedAudioStreamIndex = null;
         this._extAudioElement = null;
         this._extAudioStream = null;
         this._extAudioPlayer = null;
@@ -338,6 +340,7 @@ class LibmediaPlayer {
         this._timeUpdated = false;
         this._paused = false;
         this._currentPlayOptions = options;
+        this._selectedAudioStreamIndex = null;
         // reset jf-rendered subtitle state
         this._customTrackIndex = -1;
         this._customSecondaryTrackIndex = -1;
@@ -786,10 +789,20 @@ class LibmediaPlayer {
 
     getAudioStreamIndex() {
         try {
+            if (this._externalAudioActive) {
+                return this._extAudioSelectedIndex;
+            }
+
+            if (this._selectedAudioStreamIndex != null) {
+                return this._selectedAudioStreamIndex;
+            }
+
             const jfStreams = this._currentPlayOptions?.mediaSource?.MediaStreams || [];
             const streams = this._avplayer.getStreams?.() || [];
-            const current = this._avplayer.selectedAudioStream || null;
-            if (!current) return null;
+            const currentId = this._avplayer.getSelectedAudioStreamId?.() ?? this._avplayer.selectedAudioStream?.id ?? -1;
+            if (currentId == null || currentId < 0) {
+                return null;
+            }
 
             // Get audio streams from jellyfin (excluding external ones)
             const jfAudioStreams = jfStreams.filter((s) => s.Type === 'Audio' && !s.IsExternal)
@@ -798,18 +811,18 @@ class LibmediaPlayer {
             // Get audio streams from libmedia
             const libAudioStreams = streams.filter((s) => {
                 const codecType = s.codecpar?.codecType || s.codecparProxy?.codecType;
-                return codecType === 1 || codecType === 'AVMEDIA_TYPE_AUDIO';
+                return codecType === 1 || String(codecType) === 'AVMEDIA_TYPE_AUDIO';
             });
 
             // Find position of current libmedia stream in libmedia audio streams
-            const libStreamPosition = libAudioStreams.findIndex((s) => s.id === current.id);
+            const libStreamPosition = libAudioStreams.findIndex((s) => s.id === currentId);
             if (libStreamPosition >= 0 && libStreamPosition < jfAudioStreams.length) {
                 const jfStream = jfAudioStreams[libStreamPosition];
-                console.debug(`Current audio stream libmedia id ${current.id} maps to jellyfin index ${jfStream.Index}`);
+                console.debug(`Current audio stream libmedia id ${currentId} maps to jellyfin index ${jfStream.Index}`);
                 return jfStream.Index;
             }
 
-            console.warn(`Failed to map current libmedia audio stream id ${current.id} to jellyfin index`);
+            console.warn(`Failed to map current libmedia audio stream id ${currentId} to jellyfin index`);
             return null;
         } catch (error) {
             console.error('Error getting audio stream index:', error);
@@ -819,7 +832,7 @@ class LibmediaPlayer {
 
     async setAudioStreamIndex(index) {
         if (!this._avplayer?.selectAudio) return;
-        
+
         try {
             // External audio stream (m4a/mka etc.) handled via auxiliary libmedia in MediaStream mode
             const mediaSource = this._currentPlayOptions?.mediaSource;
@@ -828,9 +841,14 @@ class LibmediaPlayer {
             if (jfStream?.IsExternal) {
                 await this._activateExternalAudioForStream(jfStream, item, mediaSource);
                 this._extAudioSelectedIndex = index;
+                this._selectedAudioStreamIndex = index;
+                Events.trigger(this, 'mediastreamschange');
                 return;
             } else {
                 // switching back to internal
+                if (this._externalAudioActive) {
+                    this._selectedAudioStreamIndex = null;
+                }
                 this._deactivateExternalAudio();
                 this._extAudioSelectedIndex = null;
             }
@@ -843,8 +861,9 @@ class LibmediaPlayer {
 
             console.debug(`Switching to audio stream jellyfin index ${index}, libmedia id ${libId}`);
             try {
-                const retryLibId = this._mapJellyfinStreamIndexToLibId(index, 'audio');
-                await this._avplayer.selectAudio(retryLibId);
+                await this._avplayer.selectAudio(libId);
+                this._selectedAudioStreamIndex = index;
+                Events.trigger(this, 'mediastreamschange');
                 console.debug(`Successfully switched to audio stream ${libId}`);
                 return;
             } catch (err) {
@@ -900,7 +919,7 @@ class LibmediaPlayer {
             // Get streams of the same type from libmedia
             const libStreams = streams.filter((s) => {
                 const codecType = s.codecpar?.codecType || s.codecparProxy?.codecType;
-                if (kind === 'audio') return codecType === 1 || codecType === 'AVMEDIA_TYPE_AUDIO';
+                if (kind === 'audio') return codecType === 1 || String(codecType) === 'AVMEDIA_TYPE_AUDIO';
                 return false;
             });
 
