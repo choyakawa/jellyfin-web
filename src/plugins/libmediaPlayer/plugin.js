@@ -12,6 +12,28 @@ import * as htmlMediaHelper from '../../components/htmlMediaHelper';
 import { ServerConnections } from 'lib/jellyfin-apiclient';
 import { playbackManager } from '../../components/playback/playbackmanager';
 
+function normalizeAVPlayerExports(mod) {
+    const AVPlayer = mod?.default || window.AVPlayer;
+    if (!AVPlayer) return null;
+
+    if (!AVPlayer.Events && mod?.Events) {
+        AVPlayer.Events = mod.Events;
+    }
+    if (!AVPlayer.eventType) {
+        AVPlayer.eventType = AVPlayer.Events || mod?.Events || {};
+    }
+    if (!AVPlayer.RenderMode) {
+        AVPlayer.RenderMode = { FIT: 0, FILL: 1 };
+    }
+
+    window.AVPlayer = AVPlayer;
+    return AVPlayer;
+}
+
+function getAVPlayerLoadOptions(httpOptions) {
+    return httpOptions ? { http: httpOptions } : undefined;
+}
+
 function zoomIn(elem) {
     return new Promise(resolve => {
         const duration = 240;
@@ -25,20 +47,21 @@ function zoomIn(elem) {
 }
 
 async function ensureAVPlayerLoaded() {
-    if (window.AVPlayer) return;
+    if (window.AVPlayer) {
+        normalizeAVPlayerExports({});
+        return;
+    }
     // Prefer ESM to avoid import.meta errors in UMD on some setups
     try {
         // eslint-disable-next-line import/no-dynamic-require
         const mod = await (0, eval)('import(/**/ /* webpackIgnore: true */ "libraries/libmedia/esm/avplayer.js")');
-        if (mod?.default) {
-            window.AVPlayer = mod.default;
+        if (normalizeAVPlayerExports(mod)) {
             return;
         }
     } catch (_) { /* ignore */ }
     try {
         const mod = await (0, eval)('import(/**/ /* webpackIgnore: true */ "https://cdn.jsdelivr.net/npm/@libmedia/avplayer/dist/esm/avplayer.js")');
-        if (mod?.default) {
-            window.AVPlayer = mod.default;
+        if (normalizeAVPlayerExports(mod)) {
             return;
         }
     } catch (_) { /* ignore */ }
@@ -47,7 +70,10 @@ async function ensureAVPlayerLoaded() {
         const script = document.createElement('script');
         script.src = 'libraries/libmedia/avplayer.js';
         script.async = true;
-        script.onload = () => resolve();
+        script.onload = () => {
+            normalizeAVPlayerExports({});
+            resolve();
+        };
         script.onerror = (e) => reject(e);
         document.head.appendChild(script);
     });
@@ -288,7 +314,7 @@ class LibmediaPlayer {
             this.isFetching = true;
             Events.trigger(this, 'beginFetch');
             try {
-                await this._avplayer.load(url);
+                await this._avplayer.load(url, getAVPlayerLoadOptions(httpOptions));
             } catch (primaryErr) {
                 // Fallback: switch to MediaStream mode (still uses <video> element via srcObject)
                 console.warn('[LibmediaPlayer] MSE load failed, attempting MediaStream fallback:', primaryErr);
@@ -491,7 +517,7 @@ class LibmediaPlayer {
 
         // Re-bind events to the new instance
         this._bindEvents();
-        await this._avplayer.load(url);
+        await this._avplayer.load(url, getAVPlayerLoadOptions(httpOptions));
         this._prefersMSE = false;
         // Ensure ghost video exists for canvas path before any external audio might attach
         try { this._ensureGhostVideoElement(); } catch {}
@@ -581,7 +607,7 @@ class LibmediaPlayer {
         });
 
         this._bindEvents();
-        await this._avplayer.load(url);
+        await this._avplayer.load(url, getAVPlayerLoadOptions(httpOptions));
         this._prefersMSE = false;
         try { await this._avplayer.play(); } catch {}
         try { this._reapplySubtitlesAfterPipelineChange(); } catch {}
@@ -676,7 +702,7 @@ class LibmediaPlayer {
 
     _bindEvents() {
         if (!this._avplayer) return;
-        const ev = window.AVPlayer?.eventType || {};
+        const ev = window.AVPlayer?.eventType || window.AVPlayer?.Events || {};
         // time updates for OSD slider
         this._avplayer.on?.(ev.TIME || 'time', () => {
             this._timeUpdated = true;
@@ -1229,8 +1255,8 @@ class LibmediaPlayer {
     setAspectRatio(val) {
         // Map to render mode if available, otherwise adjust canvas style
         try {
-            const renderMode = (window.AVPlayer?.RenderMode) || {};
-            if (this._avplayer?.setRenderMode && renderMode) {
+            const renderMode = window.AVPlayer?.RenderMode || { FIT: 0, FILL: 1 };
+            if (this._avplayer?.setRenderMode && renderMode.FIT != null && renderMode.FILL != null) {
                 if (val === 'cover') this._avplayer.setRenderMode(renderMode.FILL);
                 else if (val === 'fill') this._avplayer.setRenderMode(renderMode.FILL);
                 else this._avplayer.setRenderMode(renderMode.FIT);
@@ -1922,7 +1948,7 @@ LibmediaPlayer.prototype._activateExternalAudioForStream = async function (track
 
         // Reset sync flags and bind aux events to guard resync logic
         try {
-            const ev = window.AVPlayer?.eventType || {};
+            const ev = window.AVPlayer?.eventType || window.AVPlayer?.Events || {};
             this._extAudioPrimed = false;
             this._extAudioSeekInProgress = false;
             this._extAudioLastResyncTs = 0;
@@ -1948,7 +1974,7 @@ LibmediaPlayer.prototype._activateExternalAudioForStream = async function (track
             });
         } catch {}
 
-        await aux.load(url);
+        await aux.load(url, getAVPlayerLoadOptions(this._httpOptions));
         try { await aux.play(); } catch {}
 
         try { this._avplayer?.setVolume?.(0, true); this._mutedMainDueToExternal = true; } catch {}

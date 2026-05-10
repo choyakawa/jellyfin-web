@@ -33,7 +33,8 @@ const LibmediaAssets = fs.existsSync(LIBMEDIA_ESM_DIR) || fs.existsSync(LIBMEDIA
                 to: 'libraries/libmedia/esm/avplayer.js'
             },
             {
-                from: path.resolve(LIBMEDIA_ESM_DIR, '[0-9]*.avplayer.js'),
+                from: '*.avplayer.js',
+                context: LIBMEDIA_ESM_DIR,
                 to: 'libraries/libmedia/esm/[name][ext]',
                 noErrorOnMissing: true
             }
@@ -45,7 +46,8 @@ const LibmediaAssets = fs.existsSync(LIBMEDIA_ESM_DIR) || fs.existsSync(LIBMEDIA
                 to: 'libraries/libmedia/avplayer.js'
             },
             {
-                from: path.resolve(LIBMEDIA_UMD_DIR, '[0-9]*.avplayer.js'),
+                from: '*.avplayer.js',
+                context: LIBMEDIA_UMD_DIR,
                 to: 'libraries/libmedia/[name][ext]',
                 noErrorOnMissing: true
             }
