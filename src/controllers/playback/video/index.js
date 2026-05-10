@@ -38,6 +38,14 @@ function getOpenedDialog() {
     return document.querySelector('.dialogContainer .dialog.opened');
 }
 
+function ignoreExpectedActionSheetClose(err) {
+    if (err?.message === 'ActionSheet closed without resolving') {
+        return;
+    }
+
+    console.error(err);
+}
+
 export default function (view) {
     function getDisplayItem(item) {
         if (item.Type === 'TvChannel') {
@@ -974,7 +982,7 @@ export default function (view) {
                     stats: true,
                     suboffset: showSubOffset,
                     onOption: onSettingsOption
-                }).finally(() => {
+                }).catch(ignoreExpectedActionSheetClose).finally(() => {
                     resetIdle();
                 });
 
@@ -1047,7 +1055,7 @@ export default function (view) {
                 if (index !== currentIndex) {
                     playbackManager.setAudioStreamIndex(index, player);
                 }
-            }).finally(() => {
+            }).catch(ignoreExpectedActionSheetClose).finally(() => {
                 resetIdle();
             });
 
@@ -1094,7 +1102,7 @@ export default function (view) {
                     playbackManager.setSecondarySubtitleStreamIndex(index, player);
                 }
             }
-        })
+        }).catch(ignoreExpectedActionSheetClose)
             .finally(() => {
                 resetIdle();
             });
@@ -1174,7 +1182,7 @@ export default function (view) {
                 }
 
                 toggleSubtitleSync();
-            }).finally(() => {
+            }).catch(ignoreExpectedActionSheetClose).finally(() => {
                 resetIdle();
             });
 

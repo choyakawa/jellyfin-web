@@ -96,6 +96,148 @@ function tryRemoveElement(elem) {
     }
 }
 
+const LIBMEDIA_WASM_BASE_URL = 'https://cdn.jsdelivr.net/gh/zhaohappy/libmedia@latest/dist';
+const DEMO_USE_MSE = false;
+const DEMO_ENABLE_HARDWARE_ACCELERATION = true;
+const DEMO_ENABLE_WEB_CODECS = true;
+const DEMO_ENABLE_WEB_GPU = true;
+const DEMO_ENABLE_WORKER = false;
+const DEMO_ENABLE_JITTER_BUFFER = true;
+const DEMO_JITTER_BUFFER_MAX = 4;
+const DEMO_JITTER_BUFFER_MIN = 1;
+const DEMO_LOW_LATENCY = true;
+let demoSupportAtomic = true;
+let demoEnableSimd = false;
+
+function compileDemoWasmProbe(base64) {
+    if (typeof WebAssembly === 'undefined' || typeof atob === 'undefined') {
+        return Promise.reject(new Error('WebAssembly probe is not available'));
+    }
+    const binaryData = atob(base64);
+    const uint8Array = new Uint8Array(binaryData.length);
+    for (let i = 0; i < binaryData.length; i++) {
+        uint8Array[i] = binaryData.charCodeAt(i);
+    }
+    return WebAssembly.compile(uint8Array);
+}
+
+function initDemoWasmFeatureDetection() {
+    compileDemoWasmProbe('AGFzbQEAAAABBgFgAX8BfwISAQNlbnYGbWVtb3J5AgMBgIACAwIBAAcJAQVsb2FkOAAACgoBCAAgAP4SAAAL')
+        .catch(() => {
+            demoSupportAtomic = false;
+        });
+
+    compileDemoWasmProbe('AGFzbQEAAAABBQFgAAF7AhIBA2VudgZtZW1vcnkCAwGAgAIDAgEACgoBCABBAP0ABAAL')
+        .then(() => {
+            demoEnableSimd = true;
+        })
+        .catch(() => {
+            demoEnableSimd = false;
+        });
+}
+
+initDemoWasmFeatureDetection();
+
+const DEMO_DECODER_WASM_BY_CODEC_ID = {
+    2: 'mpeg2video',
+    27: 'h264',
+    30: 'theora',
+    86018: 'aac',
+    86019: 'ac3',
+    86056: 'eac3',
+    86020: 'dca',
+    86017: 'mp3',
+    173: 'hevc',
+    196: 'vvc',
+    12: 'mpeg4',
+    225: 'av1',
+    86051: 'speex',
+    86076: 'opus',
+    86028: 'flac',
+    86021: 'vorbis',
+    139: 'vp8',
+    167: 'vp9',
+    86022: 'dvaudio',
+    24: 'dvvideo',
+    3: 'h261',
+    4: 'h263',
+    20: 'h263',
+    19: 'h263',
+    14: 'msmpeg4',
+    15: 'msmpeg4',
+    16: 'msmpeg4',
+    5: 'msmpeg4',
+    6: 'msmpeg4',
+    68: 'msmpeg4',
+    69: 'msmpeg4',
+    86036: 'ra',
+    86057: 'ra',
+    86073: 'ra',
+    86023: 'wma',
+    86024: 'wma',
+    86052: 'wma',
+    86054: 'wma',
+    86053: 'wma',
+    17: 'wmv',
+    18: 'wmv',
+    71: 'wmv',
+    7: 'mjpeg',
+    61: 'png',
+    171: 'webp',
+    97: 'gif',
+    96: 'tiff',
+    78: 'bmp'
+};
+
+function getDemoWasmUrl(wasmBaseUrl, type, codecId) {
+    let suffix = '';
+    if (demoEnableSimd) {
+        suffix = '-simd';
+    } else if (demoSupportAtomic) {
+        suffix = '-atomic';
+    }
+
+    if (type === 'decoder') {
+        if (codecId >= 65536 && codecId <= 65572) {
+            return `${wasmBaseUrl}/decode/pcm${suffix}.wasm`;
+        }
+        if (codecId >= 69632 && codecId <= 69683) {
+            return `${wasmBaseUrl}/decode/adpcm${suffix}.wasm`;
+        }
+
+        if (Object.prototype.hasOwnProperty.call(DEMO_DECODER_WASM_BY_CODEC_ID, codecId)) {
+            return `${wasmBaseUrl}/decode/${DEMO_DECODER_WASM_BY_CODEC_ID[codecId]}${suffix}.wasm`;
+        }
+
+        return null;
+    }
+    if (type === 'resampler') {
+        return `${wasmBaseUrl}/resample/resample${suffix}.wasm`;
+    }
+    if (type === 'stretchpitcher') {
+        return `${wasmBaseUrl}/stretchpitch/stretchpitch${suffix}.wasm`;
+    }
+    return null;
+}
+
+function getDemoAVPlayerOptions(container, wasmBaseUrl, httpOptions) {
+    return {
+        container,
+        getWasm: (type, codecId) => getDemoWasmUrl(wasmBaseUrl, type, codecId),
+        checkUseMSE: () => DEMO_USE_MSE,
+        enableHardware: DEMO_ENABLE_HARDWARE_ACCELERATION,
+        enableWebCodecs: DEMO_ENABLE_WEB_CODECS,
+        enableWebGPU: DEMO_ENABLE_WEB_GPU,
+        enableWorker: DEMO_ENABLE_WORKER,
+        enableJitterBuffer: DEMO_ENABLE_JITTER_BUFFER,
+        jitterBufferMax: DEMO_JITTER_BUFFER_MAX,
+        jitterBufferMin: DEMO_JITTER_BUFFER_MIN,
+        lowLatency: DEMO_LOW_LATENCY,
+        wasmBaseUrl,
+        http: httpOptions
+    };
+}
+
 class LibmediaPlayer {
     constructor() {
         this.name = 'Libmedia Player';
@@ -125,13 +267,10 @@ class LibmediaPlayer {
         this._secondaryTrackOffset = 0;
         this._showSubtitleOffset = false;
         this.setSubtitleOffset = debounce(this._setSubtitleOffset.bind(this), 100);
-        this._prefersMSE = true;
         this._wasmBaseUrl = null;
         this._httpOptions = null;
         // Bound handler for browser back/forward navigation (popstate)
         this._boundPopState = null;
-        // Guard to avoid recursive fallback attempts
-        this._inFallback = false;
         // MediaStream fallback time normalization state
         this._mediaStreamVideo = null;
         this._nativeCurrentTimeGet = null;
@@ -198,7 +337,6 @@ class LibmediaPlayer {
         this._started = false;
         this._timeUpdated = false;
         this._paused = false;
-        this._prefersMSE = true;
         this._currentPlayOptions = options;
         // reset jf-rendered subtitle state
         this._customTrackIndex = -1;
@@ -248,55 +386,11 @@ class LibmediaPlayer {
         const includeCorsCredentials = await getIncludeCorsCredentials();
         const httpOptions = includeCorsCredentials ? { credentials: 'include' } : undefined;
 
-        const wasmCdn = 'https://cdn.jsdelivr.net/gh/zhaohappy/libmedia@latest/dist';
+        const wasmCdn = LIBMEDIA_WASM_BASE_URL;
         this._wasmBaseUrl = wasmCdn;
         /** @type {import('@libmedia/avplayer').default} */
         // eslint-disable-next-line no-undef
-        this._avplayer = new window.AVPlayer({
-            container: this._container,
-            enableHardware: true,
-            enableWebCodecs: true,
-            enableWebGPU: false,
-            enableWorker: true,
-            wasmBaseUrl: `${wasmCdn}`,
-            http: httpOptions,
-            // Prefer MSE; libmedia will attach to a <video> internally when possible
-            checkUseMES: () => true,
-            getWasm: (type, codecId /*, mediaType */) => {
-                const suffix = '';
-                if (type === 'decoder') {
-                    switch (codecId) {
-                        case 2: return `${wasmCdn}/decode/mpeg2video${suffix}.wasm`;
-                        case 12: return `${wasmCdn}/decode/mpeg4${suffix}.wasm`;
-                        case 27: return `${wasmCdn}/decode/h264${suffix}.wasm`;
-                        case 30: return `${wasmCdn}/decode/theora${suffix}.wasm`;
-                        case 139: return `${wasmCdn}/decode/vp8${suffix}.wasm`;
-                        case 167: return `${wasmCdn}/decode/vp9${suffix}.wasm`;
-                        case 173: return `${wasmCdn}/decode/hevc${suffix}.wasm`;
-                        case 196: return `${wasmCdn}/decode/vvc${suffix}.wasm`;
-                        case 225: return `${wasmCdn}/decode/av1${suffix}.wasm`;
-                        case 86017: return `${wasmCdn}/decode/mp3${suffix}.wasm`;
-                        case 86018: return `${wasmCdn}/decode/aac${suffix}.wasm`;
-                        case 86019: return `${wasmCdn}/decode/ac3${suffix}.wasm`;
-                        case 86020: return `${wasmCdn}/decode/dca${suffix}.wasm`;
-                        case 86021: return `${wasmCdn}/decode/vorbis${suffix}.wasm`;
-                        case 86022: return `${wasmCdn}/decode/dvaudio${suffix}.wasm`;
-                        case 86024: return `${wasmCdn}/decode/wma${suffix}.wasm`;
-                        case 86028: return `${wasmCdn}/decode/flac${suffix}.wasm`;
-                        case 86051: return `${wasmCdn}/decode/speex${suffix}.wasm`;
-                        case 86056: return `${wasmCdn}/decode/eac3${suffix}.wasm`;
-                        case 86076: return `${wasmCdn}/decode/opus${suffix}.wasm`;
-                        case 7: return `${wasmCdn}/decode/mjpeg${suffix}.wasm`;
-                        default: return null;
-                    }
-                } else if (type === 'resampler') {
-                    return `${wasmCdn}/resample/resample${suffix}.wasm`;
-                } else if (type === 'stretchpitcher') {
-                    return `${wasmCdn}/stretchpitch/stretchpitch${suffix}.wasm`;
-                }
-                return null;
-            }
-        });
+        this._avplayer = new window.AVPlayer(getDemoAVPlayerOptions(this._container, wasmCdn, httpOptions));
 
         const url = this._computeUrl(options);
         this._currentSrc = url;
@@ -313,24 +407,7 @@ class LibmediaPlayer {
             // Show fetching indicator for OSD
             this.isFetching = true;
             Events.trigger(this, 'beginFetch');
-            try {
-                await this._avplayer.load(url, getAVPlayerLoadOptions(httpOptions));
-            } catch (primaryErr) {
-                // Fallback: switch to MediaStream mode (still uses <video> element via srcObject)
-                console.warn('[LibmediaPlayer] MSE load failed, attempting MediaStream fallback:', primaryErr);
-                try {
-                    await this._switchToMediaStreamMode(url, wasmCdn, httpOptions);
-                } catch (fallbackErr) {
-                    console.error('[LibmediaPlayer] MediaStream fallback failed:', fallbackErr);
-                    // Final fallback: force canvas pipeline (no MSE / no MediaStream)
-                    try {
-                        await this._forceCanvasFallback(url, wasmCdn, httpOptions);
-                    } catch (canvasErr) {
-                        console.error('[LibmediaPlayer] Canvas fallback failed:', canvasErr);
-                        throw primaryErr;
-                    }
-                }
-            }
+            await this._avplayer.load(url, getAVPlayerLoadOptions(httpOptions));
 
             // initial volume - ensure correct range 
             this.setVolume(this._volume);
@@ -412,207 +489,6 @@ class LibmediaPlayer {
         // Do not auto-tear down on browser navigation; let OSD/router manage lifecycle
     }
 
-    async _switchToMediaStreamMode(url, wasmCdn, httpOptions) {
-        // Clean current player instance if any
-        try { await this._avplayer?.destroy?.(); } catch {}
-        this._avplayer = null;
-
-        // Ensure a visible render container exists inside the dialog
-        if (!this._videoDialog || !document.body.contains(this._videoDialog)) {
-            // Safety: recreate the whole dialog if somehow got removed
-            await import('./style.scss');
-            const dlg = document.createElement('div');
-            dlg.setAttribute('dir', 'ltr');
-            dlg.classList.add('libmediaPlayerContainer');
-            dlg.id = 'libmediaPlayer';
-            document.body.insertBefore(dlg, document.body.firstChild);
-            this._videoDialog = dlg;
-        }
-
-        if (!this._container || !this._container.isConnected) {
-            // Reuse and minimally mutate DOM to avoid breaking OSD and bindings
-            const existing = this._videoDialog.querySelector('.libmediaPlayer');
-            if (existing) {
-                this._container = existing;
-                this._container.innerHTML = '';
-            } else {
-                const fresh = document.createElement('div');
-                fresh.classList.add('libmediaPlayer');
-                fresh.style.width = '100%';
-                fresh.style.height = '100%';
-                this._videoDialog.appendChild(fresh);
-                this._container = fresh;
-            }
-        } else {
-            // Reattach existing container if detached
-            if (!document.body.contains(this._container)) {
-                this._videoDialog.appendChild(this._container);
-            }
-            this._container.innerHTML = '';
-        }
-
-        // Create <video> element bound to MediaStream
-        const mediaStream = new MediaStream();
-        const video = document.createElement('video');
-        video.playsInline = true;
-        video.webkitPlaysInline = true;
-        video.autoplay = true;
-        video.controls = false;
-        video.style.width = '100%';
-        video.style.height = '100%';
-        video.srcObject = mediaStream;
-
-        // Mark as libmedia-managed video for future safe cleanup
-        try { video.classList.add('avplayer-video'); } catch {}
-        this._container.appendChild(video);
-
-        // Normalize HTMLVideoElement currentTime for MediaStream so it starts from 0s, not a wall-clock timestamp
-        try { this._patchMediaStreamCurrentTime(video); } catch (_) {}
-
-        // eslint-disable-next-line no-undef
-        this._avplayer = new window.AVPlayer({
-            container: mediaStream,
-            enableHardware: true,
-            enableWebCodecs: true,
-            enableWebGPU: false,
-            enableWorker: true,
-            wasmBaseUrl: `${wasmCdn}`,
-            http: httpOptions,
-            checkUseMES: () => false,
-            getWasm: (type, codecId) => {
-                const suffix = '';
-                if (type === 'decoder') {
-                    switch (codecId) {
-                        case 2: return `${wasmCdn}/decode/mpeg2video${suffix}.wasm`;
-                        case 12: return `${wasmCdn}/decode/mpeg4${suffix}.wasm`;
-                        case 27: return `${wasmCdn}/decode/h264${suffix}.wasm`;
-                        case 30: return `${wasmCdn}/decode/theora${suffix}.wasm`;
-                        case 139: return `${wasmCdn}/decode/vp8${suffix}.wasm`;
-                        case 167: return `${wasmCdn}/decode/vp9${suffix}.wasm`;
-                        case 173: return `${wasmCdn}/decode/hevc${suffix}.wasm`;
-                        case 196: return `${wasmCdn}/decode/vvc${suffix}.wasm`;
-                        case 225: return `${wasmCdn}/decode/av1${suffix}.wasm`;
-                        case 86017: return `${wasmCdn}/decode/mp3${suffix}.wasm`;
-                        case 86018: return `${wasmCdn}/decode/aac${suffix}.wasm`;
-                        case 86019: return `${wasmCdn}/decode/ac3${suffix}.wasm`;
-                        case 86020: return `${wasmCdn}/decode/dca${suffix}.wasm`;
-                        case 86021: return `${wasmCdn}/decode/vorbis${suffix}.wasm`;
-                        case 86022: return `${wasmCdn}/decode/dvaudio${suffix}.wasm`;
-                        case 86024: return `${wasmCdn}/decode/wma${suffix}.wasm`;
-                        case 86028: return `${wasmCdn}/decode/flac${suffix}.wasm`;
-                        case 86051: return `${wasmCdn}/decode/speex${suffix}.wasm`;
-                        case 86056: return `${wasmCdn}/decode/eac3${suffix}.wasm`;
-                        case 86076: return `${wasmCdn}/decode/opus${suffix}.wasm`;
-                        case 7: return `${wasmCdn}/decode/mjpeg${suffix}.wasm`;
-                        default: return null;
-                    }
-                } else if (type === 'resampler') {
-                    return `${wasmCdn}/resample/resample${suffix}.wasm`;
-                } else if (type === 'stretchpitcher') {
-                    return `${wasmCdn}/stretchpitch/stretchpitch${suffix}.wasm`;
-                }
-                return null;
-            }
-        });
-
-        // Re-bind events to the new instance
-        this._bindEvents();
-        await this._avplayer.load(url, getAVPlayerLoadOptions(httpOptions));
-        this._prefersMSE = false;
-        // Ensure ghost video exists for canvas path before any external audio might attach
-        try { this._ensureGhostVideoElement(); } catch {}
-        try { await this._avplayer.play(); } catch {}
-        try { this._reapplySubtitlesAfterPipelineChange(); } catch {}
-    }
-
-    async _ensureMediaStreamFallback() {
-        if (!this._prefersMSE) return false;
-        const posMs = (() => { try { return Number(this._avplayer?.currentTime || 0n); } catch { return 0; } })();
-        await this._switchToMediaStreamMode(this._currentSrc, this._wasmBaseUrl, this._httpOptions);
-        try {
-            if (posMs > 0) await this._avplayer.seek(BigInt(Math.floor(posMs)));
-        } catch {}
-        try { await this._avplayer.play(); } catch {}
-        try { this._reapplySubtitlesAfterPipelineChange(); } catch {}
-        return true;
-    }
-
-    async _forceCanvasFallback(url, wasmCdn, httpOptions) {
-        // Clean current player instance if any
-        try { await this._avplayer?.destroy?.(); } catch {}
-        this._avplayer = null;
-
-        // Ensure container exists
-        if (!this._container || !this._container.isConnected) {
-            const existing = this._videoDialog?.querySelector?.('.libmediaPlayer');
-            if (existing) {
-                this._container = existing;
-                this._container.innerHTML = '';
-            } else {
-                const fresh = document.createElement('div');
-                fresh.classList.add('libmediaPlayer');
-                fresh.style.width = '100%';
-                fresh.style.height = '100%';
-                this._videoDialog?.appendChild?.(fresh);
-                this._container = fresh;
-            }
-        } else {
-            this._container.innerHTML = '';
-        }
-
-        // eslint-disable-next-line no-undef
-        this._avplayer = new window.AVPlayer({
-            container: this._container,
-            enableHardware: true,
-            enableWebCodecs: true,
-            enableWebGPU: false,
-            enableWorker: true,
-            wasmBaseUrl: `${wasmCdn}`,
-            http: httpOptions,
-            checkUseMES: () => false,
-            getWasm: (type, codecId) => {
-                const suffix = '';
-                if (type === 'decoder') {
-                    switch (codecId) {
-                        case 2: return `${wasmCdn}/decode/mpeg2video${suffix}.wasm`;
-                        case 12: return `${wasmCdn}/decode/mpeg4${suffix}.wasm`;
-                        case 27: return `${wasmCdn}/decode/h264${suffix}.wasm`;
-                        case 30: return `${wasmCdn}/decode/theora${suffix}.wasm`;
-                        case 139: return `${wasmCdn}/decode/vp8${suffix}.wasm`;
-                        case 167: return `${wasmCdn}/decode/vp9${suffix}.wasm`;
-                        case 173: return `${wasmCdn}/decode/hevc${suffix}.wasm`;
-                        case 196: return `${wasmCdn}/decode/vvc${suffix}.wasm`;
-                        case 225: return `${wasmCdn}/decode/av1${suffix}.wasm`;
-                        case 86017: return `${wasmCdn}/decode/mp3${suffix}.wasm`;
-                        case 86018: return `${wasmCdn}/decode/aac${suffix}.wasm`;
-                        case 86019: return `${wasmCdn}/decode/ac3${suffix}.wasm`;
-                        case 86020: return `${wasmCdn}/decode/dca${suffix}.wasm`;
-                        case 86021: return `${wasmCdn}/decode/vorbis${suffix}.wasm`;
-                        case 86022: return `${wasmCdn}/decode/dvaudio${suffix}.wasm`;
-                        case 86024: return `${wasmCdn}/decode/wma${suffix}.wasm`;
-                        case 86028: return `${wasmCdn}/decode/flac${suffix}.wasm`;
-                        case 86051: return `${wasmCdn}/decode/speex${suffix}.wasm`;
-                        case 86056: return `${wasmCdn}/decode/eac3${suffix}.wasm`;
-                        case 86076: return `${wasmCdn}/decode/opus${suffix}.wasm`;
-                        case 7: return `${wasmCdn}/decode/mjpeg${suffix}.wasm`;
-                        default: return null;
-                    }
-                } else if (type === 'resampler') {
-                    return `${wasmCdn}/resample/resample${suffix}.wasm`;
-                } else if (type === 'stretchpitcher') {
-                    return `${wasmCdn}/stretchpitch/stretchpitch${suffix}.wasm`;
-                }
-                return null;
-            }
-        });
-
-        this._bindEvents();
-        await this._avplayer.load(url, getAVPlayerLoadOptions(httpOptions));
-        this._prefersMSE = false;
-        try { await this._avplayer.play(); } catch {}
-        try { this._reapplySubtitlesAfterPipelineChange(); } catch {}
-    }
-
     _reapplySubtitlesAfterPipelineChange() {
         const ms = this._currentPlayOptions?.mediaSource;
         const item = this._currentPlayOptions?.item;
@@ -642,10 +518,6 @@ class LibmediaPlayer {
         if (!item || !mediaSource) return '';
         const apiClient = ServerConnections.getApiClient(item.ServerId);
         if (!apiClient) return '';
-        // Transcoding url if any
-        if (mediaSource.SupportsTranscoding && mediaSource.TranscodingUrl) {
-            return apiClient.getUrl(mediaSource.TranscodingUrl);
-        }
         const mediaType = (options?.mediaType || item.MediaType || '').toLowerCase();
         const prefix = mediaType === 'audio' ? 'Audio' : 'Videos';
         const container = (mediaSource.Container || 'mkv').toLowerCase();
@@ -754,17 +626,7 @@ class LibmediaPlayer {
         this._avplayer.on?.(ev.STOPPED || 'stopped', () => {
             this._onEndedInternal();
         });
-        this._avplayer.on?.(ev.ERROR || 'error', async (err) => {
-            try {
-                if (this._prefersMSE && !this._inFallback) {
-                    this._inFallback = true;
-                    const switched = await this._ensureMediaStreamFallback();
-                    this._inFallback = false;
-                    if (switched) return;
-                }
-            } catch (_) {
-                this._inFallback = false;
-            }
+        this._avplayer.on?.(ev.ERROR || 'error', (err) => {
             Events.trigger(this, 'error', [err?.message || 'ErrorDefault']);
         });
         this._avplayer.on?.(ev.STREAM_UPDATE || 'streamUpdate', () => {
@@ -989,18 +851,8 @@ class LibmediaPlayer {
                 const msg = String(err?.message || err || '').toLowerCase();
                 const notSupportMse = msg.includes('not support mse') || msg.includes('not support mes') || msg.includes('not support');
                 if (!notSupportMse) throw err;
-                console.warn('[LibmediaPlayer] selectAudio not supported in MSE path, attempting fallback to MediaStream');
-            }
-
-            // If we get here, try switching pipeline to MediaStream and retry
-            const switched = await this._ensureMediaStreamFallback();
-            if (switched) {
-                try {
-                    await this._avplayer.selectAudio(libId);
-                    console.debug(`Successfully switched to audio stream ${libId} after fallback`);
-                } catch (retryErr) {
-                    console.error('Retry selectAudio after fallback failed:', retryErr);
-                }
+                console.warn('[LibmediaPlayer] selectAudio not supported by the current libmedia pipeline:', err);
+                return;
             }
         } catch (error) {
             console.error(`Error switching audio stream to index ${index}:`, error);
@@ -1910,41 +1762,9 @@ LibmediaPlayer.prototype._activateExternalAudioForStream = async function (track
         // Patch audio currentTime to proxy aux libmedia clock (for debugging and external queries)
         try { this._patchAuxAudioElementCurrentTime(audioElem); } catch {}
 
-        const wasmCdn = this._wasmBaseUrl || 'https://cdn.jsdelivr.net/gh/zhaohappy/libmedia@latest/dist';
+        const wasmCdn = this._wasmBaseUrl || LIBMEDIA_WASM_BASE_URL;
         // eslint-disable-next-line no-undef
-        const aux = new window.AVPlayer({
-            container: audioStream,
-            enableHardware: true,
-            enableWebCodecs: true,
-            enableWebGPU: false,
-            enableWorker: true,
-            wasmBaseUrl: `${wasmCdn}`,
-            http: this._httpOptions,
-            checkUseMES: () => false,
-            getWasm: (type, codecId) => {
-                const suffix = '';
-                if (type === 'decoder') {
-                    switch (codecId) {
-                        case 86017: return `${wasmCdn}/decode/mp3${suffix}.wasm`;
-                        case 86018: return `${wasmCdn}/decode/aac${suffix}.wasm`;
-                        case 86019: return `${wasmCdn}/decode/ac3${suffix}.wasm`;
-                        case 86020: return `${wasmCdn}/decode/dca${suffix}.wasm`;
-                        case 86021: return `${wasmCdn}/decode/vorbis${suffix}.wasm`;
-                        case 86024: return `${wasmCdn}/decode/wma${suffix}.wasm`;
-                        case 86028: return `${wasmCdn}/decode/flac${suffix}.wasm`;
-                        case 86051: return `${wasmCdn}/decode/speex${suffix}.wasm`;
-                        case 86056: return `${wasmCdn}/decode/eac3${suffix}.wasm`;
-                        case 86076: return `${wasmCdn}/decode/opus${suffix}.wasm`;
-                        default: return null;
-                    }
-                } else if (type === 'resampler') {
-                    return `${wasmCdn}/resample/resample${suffix}.wasm`;
-                } else if (type === 'stretchpitcher') {
-                    return `${wasmCdn}/stretchpitch/stretchpitch${suffix}.wasm`;
-                }
-                return null;
-            }
-        });
+        const aux = new window.AVPlayer(getDemoAVPlayerOptions(audioStream, wasmCdn, this._httpOptions));
 
         // Reset sync flags and bind aux events to guard resync logic
         try {
