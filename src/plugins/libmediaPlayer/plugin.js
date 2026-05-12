@@ -30,8 +30,20 @@ function normalizeAVPlayerExports(mod) {
     return AVPlayer;
 }
 
-function getAVPlayerLoadOptions(httpOptions) {
-    return httpOptions ? { http: httpOptions } : undefined;
+function getAVPlayerLoadOptions(httpOptions, externalAudio) {
+    const loadOptions = {};
+    if (httpOptions) {
+        loadOptions.http = httpOptions;
+    }
+    if (externalAudio?.length) {
+        loadOptions.externalAudio = externalAudio;
+    }
+    return Object.keys(loadOptions).length ? loadOptions : undefined;
+}
+
+function normalizeStreamIndex(index) {
+    const value = Number(index);
+    return Number.isFinite(value) ? value : null;
 }
 
 function zoomIn(elem) {
@@ -52,31 +64,19 @@ async function ensureAVPlayerLoaded() {
         return;
     }
     // Prefer ESM to avoid import.meta errors in UMD on some setups
+    const avplayerBaseUrl = `${appRouter.baseUrl()}/libraries/libmedia/esm/`;
+    const avplayerUrl = `${avplayerBaseUrl}avplayer.js`;
+    window.__LIBMEDIA_AVPLAYER_BASE_URL__ = avplayerBaseUrl;
     try {
         // eslint-disable-next-line import/no-dynamic-require
-        const mod = await (0, eval)('import(/**/ /* webpackIgnore: true */ "libraries/libmedia/esm/avplayer.js")');
+        const mod = await (0, eval)(`import(/**/ /* webpackIgnore: true */ ${JSON.stringify(avplayerUrl)})`);
         if (normalizeAVPlayerExports(mod)) {
             return;
         }
-    } catch (_) { /* ignore */ }
-    try {
-        const mod = await (0, eval)('import(/**/ /* webpackIgnore: true */ "https://cdn.jsdelivr.net/npm/@libmedia/avplayer/dist/esm/avplayer.js")');
-        if (normalizeAVPlayerExports(mod)) {
-            return;
-        }
-    } catch (_) { /* ignore */ }
-    // Final fallback to UMD if ESM unavailable
-    await new Promise((resolve, reject) => {
-        const script = document.createElement('script');
-        script.src = 'libraries/libmedia/avplayer.js';
-        script.async = true;
-        script.onload = () => {
-            normalizeAVPlayerExports({});
-            resolve();
-        };
-        script.onerror = (e) => reject(e);
-        document.head.appendChild(script);
-    });
+    } catch (err) {
+        console.error('Failed to load local libmedia avplayer bundle:', avplayerUrl, err);
+    }
+    throw new Error(`Local libmedia avplayer bundle is not available: ${avplayerUrl}`);
 }
 
 function resolveUrl(url) {
@@ -96,7 +96,9 @@ function tryRemoveElement(elem) {
     }
 }
 
-const LIBMEDIA_WASM_BASE_URL = 'https://cdn.jsdelivr.net/gh/zhaohappy/libmedia@latest/dist';
+function getLibmediaWasmBaseUrl() {
+    return `${appRouter.baseUrl()}/libraries/libmedia`;
+}
 const DEMO_USE_MSE = false;
 const DEMO_ENABLE_HARDWARE_ACCELERATION = true;
 const DEMO_ENABLE_WEB_CODECS = true;
@@ -268,7 +270,6 @@ class LibmediaPlayer {
         this._secondaryTrackOffset = 0;
         this._showSubtitleOffset = false;
         this.setSubtitleOffset = debounce(this._setSubtitleOffset.bind(this), 100);
-        this._wasmBaseUrl = null;
         this._httpOptions = null;
         // Bound handler for browser back/forward navigation (popstate)
         this._boundPopState = null;
@@ -282,20 +283,12 @@ class LibmediaPlayer {
         this._ghostVideo = null;
         this._ghostUnpatch = null;
         this._pgsCustomCanvas = null;
-        // External audio state
         this._externalAudioActive = false;
         this._extAudioSelectedIndex = null;
         this._selectedAudioStreamIndex = null;
-        this._extAudioElement = null;
-        this._extAudioStream = null;
-        this._extAudioPlayer = null;
-        this._mutedMainDueToExternal = false;
-        // Sync guards
-        this._mainSeekInProgress = false;
-        this._extAudioSeekInProgress = false;
-        this._extAudioLastResyncTs = 0;
-        this._extAudioPrimed = false;
-        this._extAudioStreamIndex = -1;
+        this._externalAudioLoadOptionsByIndex = new Map();
+        this._externalAudioLoadedIndexes = new Set();
+        this._externalAudioLoadPromisesByIndex = new Map();
     }
 
     canPlayMediaType(mediaType) {
@@ -341,6 +334,11 @@ class LibmediaPlayer {
         this._paused = false;
         this._currentPlayOptions = options;
         this._selectedAudioStreamIndex = null;
+        this._externalAudioActive = false;
+        this._extAudioSelectedIndex = null;
+        this._externalAudioLoadOptionsByIndex = new Map();
+        this._externalAudioLoadedIndexes = new Set();
+        this._externalAudioLoadPromisesByIndex = new Map();
         // reset jf-rendered subtitle state
         this._customTrackIndex = -1;
         this._customSecondaryTrackIndex = -1;
@@ -389,8 +387,7 @@ class LibmediaPlayer {
         const includeCorsCredentials = await getIncludeCorsCredentials();
         const httpOptions = includeCorsCredentials ? { credentials: 'include' } : undefined;
 
-        const wasmCdn = LIBMEDIA_WASM_BASE_URL;
-        this._wasmBaseUrl = wasmCdn;
+        const wasmCdn = getLibmediaWasmBaseUrl();
         /** @type {import('@libmedia/avplayer').default} */
         // eslint-disable-next-line no-undef
         this._avplayer = new window.AVPlayer(getDemoAVPlayerOptions(this._container, wasmCdn, httpOptions));
@@ -402,6 +399,19 @@ class LibmediaPlayer {
         this._playlistIndex = options.startIndex || 0;
         // Ensure subtitle DeliveryUrl are absolute/filled to avoid apiClient.getUrl errors later
         try { this._ensureSubtitleDeliveryUrls(options); } catch {}
+        const externalAudio = this._getExternalAudioLoadOptions(options);
+        externalAudio.forEach((audio) => {
+            const index = Number(audio?.metadata?.jellyfinExternalAudioIndex);
+            if (!Number.isNaN(index)) {
+                this._externalAudioLoadOptionsByIndex.set(index, audio);
+            }
+        });
+        const defaultAudioIndex = normalizeStreamIndex(options?.mediaSource?.DefaultAudioStreamIndex);
+        const defaultAudioStream = (options?.mediaSource?.MediaStreams || [])
+            .find((stream) => stream.Type === 'Audio' && stream.Index === defaultAudioIndex);
+        const initialExternalAudio = defaultAudioStream?.IsExternal ?
+            externalAudio.filter((audio) => Number(audio?.metadata?.jellyfinExternalAudioIndex) === defaultAudioIndex) :
+            [];
 
         // Bridge libmedia events to Jellyfin events
         this._bindEvents(options);
@@ -410,9 +420,15 @@ class LibmediaPlayer {
             // Show fetching indicator for OSD
             this.isFetching = true;
             Events.trigger(this, 'beginFetch');
-            await this._avplayer.load(url, getAVPlayerLoadOptions(httpOptions));
+            await this._avplayer.load(url, getAVPlayerLoadOptions(httpOptions, initialExternalAudio));
+            initialExternalAudio.forEach((audio) => {
+                const index = Number(audio?.metadata?.jellyfinExternalAudioIndex);
+                if (!Number.isNaN(index)) {
+                    this._externalAudioLoadedIndexes.add(index);
+                }
+            });
 
-            // initial volume - ensure correct range 
+            // initial volume - ensure correct range
             this.setVolume(this._volume);
 
 
@@ -586,8 +602,6 @@ class LibmediaPlayer {
                 const timeMs = Number(this._avplayer?.currentTime || 0n);
                 this._updateSubtitleText(timeMs);
             } catch {}
-            // keep external audio synced to main clock
-            try { this._syncExternalAudioTime(); } catch {}
             Events.trigger(this, 'timeupdate');
         });
         this._avplayer.on?.(ev.PAUSED || 'paused', () => {
@@ -616,11 +630,9 @@ class LibmediaPlayer {
         // Avoid early 'playing' on LOADED to prevent OSD state machine from restarting playback
         this._avplayer.on?.(ev.LOADED || 'loaded', () => {});
         this._avplayer.on?.(ev.SEEKING || 'seeking', () => {
-            this._mainSeekInProgress = true;
             Events.trigger(this, 'waiting');
         });
         this._avplayer.on?.(ev.SEEKED || 'seeked', () => {
-            this._mainSeekInProgress = false;
             Events.trigger(this, 'playing');
         });
         this._avplayer.on?.(ev.ENDED || 'ended', () => {
@@ -709,7 +721,6 @@ class LibmediaPlayer {
             // Convert jellyfin ticks to milliseconds bigint
             const ms = BigInt(Math.floor((ticks || 0) / 10000));
             await this._avplayer.seek(ms);
-            try { await this._extAudioPlayer?.seek?.(ms); } catch {}
         } catch (err) {
             console.error('Seek failed:', err);
             throw err;
@@ -717,7 +728,6 @@ class LibmediaPlayer {
     }
 
     pause() {
-        try { this._extAudioPlayer?.pause?.(); } catch {}
         return this._avplayer?.pause();
     }
 
@@ -726,7 +736,6 @@ class LibmediaPlayer {
     }
 
     unpause() {
-        try { this._extAudioPlayer?.play?.(); } catch {}
         return this._avplayer?.play();
     }
 
@@ -752,12 +761,7 @@ class LibmediaPlayer {
         const clamped = Math.max(0, Math.min(100, Number(val) || 0));
         this._volume = clamped;
         htmlMediaHelper.saveVolume(clamped / 100);
-        if (this._externalAudioActive) {
-            if (this._extAudioElement) {
-                try { this._extAudioElement.volume = clamped / 100; } catch {}
-            }
-            try { this._avplayer?.setVolume?.(0, true); } catch {}
-        } else if (this._avplayer?.setVolume) {
+        if (this._avplayer?.setVolume) {
             this._avplayer.setVolume(clamped / 100, true);
         }
         Events.trigger(this, 'volumechange');
@@ -804,6 +808,12 @@ class LibmediaPlayer {
                 return null;
             }
 
+            const currentStream = streams.find((s) => s.id === currentId);
+            const externalIndex = currentStream?.metadata?.jellyfinExternalAudioIndex;
+            if (externalIndex != null) {
+                return Number(externalIndex);
+            }
+
             // Get audio streams from jellyfin (excluding external ones)
             const jfAudioStreams = jfStreams.filter((s) => s.Type === 'Audio' && !s.IsExternal)
                 .sort((a, b) => a.Index - b.Index);
@@ -834,14 +844,14 @@ class LibmediaPlayer {
         if (!this._avplayer?.selectAudio) return;
 
         try {
-            // External audio stream (m4a/mka etc.) handled via auxiliary libmedia in MediaStream mode
+            const streamIndex = normalizeStreamIndex(index);
+            if (streamIndex == null) return;
+
+            // External audio stream (m4a/mka etc.) is loaded into the main libmedia player
             const mediaSource = this._currentPlayOptions?.mediaSource;
-            const item = this._currentPlayOptions?.item;
-            const jfStream = (mediaSource?.MediaStreams || []).find((s) => s.Type === 'Audio' && s.Index === index);
+            const jfStream = (mediaSource?.MediaStreams || []).find((s) => s.Type === 'Audio' && s.Index === streamIndex);
             if (jfStream?.IsExternal) {
-                await this._activateExternalAudioForStream(jfStream, item, mediaSource);
-                this._extAudioSelectedIndex = index;
-                this._selectedAudioStreamIndex = index;
+                await this._activateExternalAudioForStream(jfStream);
                 Events.trigger(this, 'mediastreamschange');
                 return;
             } else {
@@ -850,19 +860,18 @@ class LibmediaPlayer {
                     this._selectedAudioStreamIndex = null;
                 }
                 this._deactivateExternalAudio();
-                this._extAudioSelectedIndex = null;
             }
 
-            const libId = this._mapJellyfinStreamIndexToLibId(index, 'audio');
+            const libId = this._mapJellyfinStreamIndexToLibId(streamIndex, 'audio');
             if (libId == null) {
-                console.warn(`Failed to map jellyfin audio stream index ${index} to libmedia id`);
+                console.warn(`Failed to map jellyfin audio stream index ${streamIndex} to libmedia id`);
                 return;
             }
 
-            console.debug(`Switching to audio stream jellyfin index ${index}, libmedia id ${libId}`);
+            console.debug(`Switching to audio stream jellyfin index ${streamIndex}, libmedia id ${libId}`);
             try {
                 await this._avplayer.selectAudio(libId);
-                this._selectedAudioStreamIndex = index;
+                this._selectedAudioStreamIndex = streamIndex;
                 Events.trigger(this, 'mediastreamschange');
                 console.debug(`Successfully switched to audio stream ${libId}`);
                 return;
@@ -911,6 +920,9 @@ class LibmediaPlayer {
 
     _mapJellyfinStreamIndexToLibId(jfIndex, kind /* 'audio' */) {
         try {
+            jfIndex = normalizeStreamIndex(jfIndex);
+            if (jfIndex == null) return null;
+
             const streams = this._avplayer.getStreams?.() || [];
             const jfStreams = this._currentPlayOptions?.mediaSource?.MediaStreams || [];
             const jfStream = jfStreams.find((s) => s.Index === jfIndex && (kind === 'audio' ? s.Type === 'Audio' : false));
@@ -922,6 +934,13 @@ class LibmediaPlayer {
                 if (kind === 'audio') return codecType === 1 || String(codecType) === 'AVMEDIA_TYPE_AUDIO';
                 return false;
             });
+
+            if (kind === 'audio' && jfStream.IsExternal) {
+                const match = libStreams.find((s) => String(s.metadata?.jellyfinExternalAudioIndex ?? '') === String(jfIndex));
+                if (match) {
+                    return match.id;
+                }
+            }
 
             // Get jellyfin streams of the same type (excluding external ones for ordering)
             const jfStreamsOfType = jfStreams.filter((s) => s.Type === 'Audio' && !s.IsExternal).sort((a, b) => a.Index - b.Index);
@@ -939,20 +958,20 @@ class LibmediaPlayer {
             const lang = (jfStream.Language || jfStream.lang || '').toLowerCase();
             const title = (jfStream.DisplayTitle || jfStream.Title || '').toLowerCase();
             const codec = (jfStream.Codec || '').toLowerCase();
-            
+
             const match = libStreams.find((s) => {
                 const md = s.metadata || {};
                 const sLang = String(md?.LANGUAGE || md?.language || '').toLowerCase();
                 const sTitle = String(md?.TITLE || md?.title || '').toLowerCase();
-                
+
                 // Try to match by language first, then title, then codec
                 if (lang && sLang === lang) return true;
                 if (title && sTitle === title) return true;
                 if (codec && s.codecpar?.codecId && this._getCodecName(s.codecpar.codecId).toLowerCase().includes(codec)) return true;
-                
+
                 return false;
             });
-            
+
             if (match) {
                 console.debug(`Mapped jellyfin ${kind} stream index ${jfIndex} to libmedia stream id ${match.id} (by metadata)`);
                 return match.id;
@@ -1115,7 +1134,6 @@ class LibmediaPlayer {
 
     setPlaybackRate(rate) {
         try { this._avplayer?.setPlaybackRate?.(Number(rate)); } catch {}
-        try { this._extAudioPlayer?.setPlaybackRate?.(Number(rate)); } catch {}
     }
 
     getPlaybackRate() {
@@ -1202,7 +1220,7 @@ class LibmediaPlayer {
             { name: '2x', id: 2.0 }
         ];
     }
-    
+
     destroy() {
         setBackdropTransparency(TRANSPARENCY_LEVEL.None);
         document.body.classList.remove('hide-scroll');
@@ -1303,30 +1321,6 @@ class LibmediaPlayer {
         this._msClockCalibrated = false;
         this._msClockOffsetSec = 0;
         this._unpatchBind = null;
-    }
-
-    // Normalize HTMLAudioElement currentTime for aux MediaStream to reflect aux libmedia clock
-    _patchAuxAudioElementCurrentTime(audioEl) {
-        if (!audioEl) return;
-        try {
-            const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
-            const self = this;
-            Object.defineProperty(audioEl, 'currentTime', {
-                configurable: true,
-                enumerable: false,
-                get() {
-                    try { return Number(self._extAudioPlayer?.currentTime || 0n) / 1000; } catch { return 0; }
-                },
-                set(val) {
-                    try {
-                        const targetMs = Math.max(0, Math.floor(Number(val || 0) * 1000));
-                        self._extAudioPlayer?.seek?.(BigInt(targetMs));
-                    } catch {}
-                }
-            });
-            // store unpatcher
-            audioEl.__auxUnpatch = () => { try { if (desc) Object.defineProperty(audioEl, 'currentTime', desc); } catch {} };
-        } catch {}
     }
 
     // ----- Ghost video for canvas path to drive libass/libpgs -----
@@ -1754,122 +1748,99 @@ LibmediaPlayer.prototype._computeExternalAudioUrl = function (track, item, media
     } catch { return ''; }
 };
 
-LibmediaPlayer.prototype._activateExternalAudioForStream = async function (track, item, mediaSource) {
+LibmediaPlayer.prototype._getExternalAudioLoadOptions = function (options) {
     try {
-        if (this._externalAudioActive && this._extAudioSelectedIndex === track?.Index) return;
-        this._deactivateExternalAudio();
-        const url = this._computeExternalAudioUrl(track, item, mediaSource);
-        if (!url) throw new Error('External audio url not available');
-
-        // Ensure a ghost video exists as the master clock for any canvas path
-        try { this._ensureGhostVideoElement(); } catch {}
-
-        // Create hidden audio element bound to MediaStream
-        const audioStream = new MediaStream();
-        const audioElem = document.createElement('audio');
-        audioElem.autoplay = true;
-        audioElem.controls = false;
-        audioElem.muted = false;
-        audioElem.playsInline = true;
-        audioElem.webkitPlaysInline = true;
-        audioElem.style.position = 'absolute';
-        audioElem.style.inset = '0';
-        audioElem.style.opacity = '0';
-        audioElem.style.pointerEvents = 'none';
-        audioElem.srcObject = audioStream;
-        (this._videoDialog || document.body).appendChild(audioElem);
-        // Patch audio currentTime to proxy aux libmedia clock (for debugging and external queries)
-        try { this._patchAuxAudioElementCurrentTime(audioElem); } catch {}
-
-        const wasmCdn = this._wasmBaseUrl || LIBMEDIA_WASM_BASE_URL;
-        // eslint-disable-next-line no-undef
-        const aux = new window.AVPlayer(getDemoAVPlayerOptions(audioStream, wasmCdn, this._httpOptions));
-
-        // Reset sync flags and bind aux events to guard resync logic
-        try {
-            const ev = window.AVPlayer?.eventType || window.AVPlayer?.Events || {};
-            this._extAudioPrimed = false;
-            this._extAudioSeekInProgress = false;
-            this._extAudioLastResyncTs = 0;
-            this._extAudioStreamIndex = -1; // Track the audio stream index for correct seeking
-            
-            aux.on?.(ev.SEEKING || 'seeking', () => { this._extAudioSeekInProgress = true; });
-            aux.on?.(ev.SEEKED || 'seeked', () => { this._extAudioSeekInProgress = false; this._extAudioLastResyncTs = performance.now ? performance.now() : Date.now(); });
-            aux.on?.(ev.LOADED || 'loaded', () => {
-                // Get the audio stream index after loading for correct seeking
-                try {
-                    const streams = aux.getStreams?.() || [];
-                    const audioStream = streams.find(s => s.codecpar?.codecType === 1); // AVMEDIA_TYPE_AUDIO = 1
-                    if (audioStream) {
-                        this._extAudioStreamIndex = audioStream.index;
+        const item = options?.item;
+        const mediaSource = options?.mediaSource;
+        return (mediaSource?.MediaStreams || [])
+            .filter((stream) => stream.Type === 'Audio' && stream.IsExternal)
+            .sort((a, b) => a.Index - b.Index)
+            .map((stream) => {
+                const source = this._computeExternalAudioUrl(stream, item, mediaSource);
+                if (!source) return null;
+                return {
+                    source,
+                    lang: stream.Language,
+                    title: stream.DisplayTitle || stream.Title || stream.Codec,
+                    metadata: {
+                        jellyfinExternalAudioIndex: String(stream.Index)
                     }
-                } catch {}
-            });
-            aux.on?.(ev.PLAYING || 'playing', () => {
-                this._extAudioPrimed = true;
-                // Apply current playback rate but avoid immediate seek on first play
-                try { const r = this.getPlaybackRate?.() ?? 1; aux.setPlaybackRate?.(Number(r)); } catch {}
-                this._extAudioLastResyncTs = performance.now ? performance.now() : Date.now();
-            });
-        } catch {}
+                };
+            })
+            .filter(Boolean);
+    } catch {
+        return [];
+    }
+};
 
-        await aux.load(url, getAVPlayerLoadOptions(this._httpOptions));
-        try { await aux.play(); } catch {}
+LibmediaPlayer.prototype._ensureExternalAudioLoaded = async function (track) {
+    if (!track?.IsExternal) return;
 
-        try { this._avplayer?.setVolume?.(0, true); this._mutedMainDueToExternal = true; } catch {}
-        try { audioElem.volume = (this._volume || 100) / 100; } catch {}
+    const index = normalizeStreamIndex(track.Index);
+    if (index == null) return;
+    if (this._externalAudioLoadedIndexes?.has(index)) return;
 
-        this._extAudioElement = audioElem;
-        this._extAudioStream = audioStream;
-        this._extAudioPlayer = aux;
+    const pending = this._externalAudioLoadPromisesByIndex?.get(index);
+    if (pending) {
+        await pending;
+        return;
+    }
+
+    const loadPromise = (async () => {
+        let loadOption = this._externalAudioLoadOptionsByIndex?.get(index);
+        if (!loadOption) {
+            const item = this._currentPlayOptions?.item;
+            const mediaSource = this._currentPlayOptions?.mediaSource;
+            const source = this._computeExternalAudioUrl(track, item, mediaSource);
+            if (!source) throw new Error('Unable to resolve external audio URL');
+            loadOption = {
+                source,
+                lang: track.Language,
+                title: track.DisplayTitle || track.Title || track.Codec,
+                metadata: {
+                    jellyfinExternalAudioIndex: String(index)
+                }
+            };
+            this._externalAudioLoadOptionsByIndex?.set(index, loadOption);
+        }
+
+        if (!this._avplayer?.loadExternalAudio) {
+            throw new Error('The current libmedia runtime cannot load external audio on demand');
+        }
+
+        await this._avplayer.loadExternalAudio(loadOption, this._httpOptions);
+        this._externalAudioLoadedIndexes?.add(index);
+    })();
+
+    this._externalAudioLoadPromisesByIndex?.set(index, loadPromise);
+    try {
+        await loadPromise;
+    } finally {
+        this._externalAudioLoadPromisesByIndex?.delete(index);
+    }
+};
+
+LibmediaPlayer.prototype._activateExternalAudioForStream = async function (track) {
+    try {
+        const trackIndex = normalizeStreamIndex(track?.Index);
+        if (trackIndex == null) return;
+        if (this._externalAudioActive && this._extAudioSelectedIndex === trackIndex) return;
+        await this._ensureExternalAudioLoaded(track);
+        const libId = this._mapJellyfinStreamIndexToLibId(trackIndex, 'audio');
+        if (libId == null) throw new Error('External audio stream is not loaded in libmedia');
+        await this._avplayer?.selectAudio?.(libId);
         this._externalAudioActive = true;
-        this._extAudioSelectedIndex = track?.Index ?? null;
-        try { const r = this.getPlaybackRate?.() ?? 1; aux.setPlaybackRate?.(Number(r)); } catch {}
+        this._extAudioSelectedIndex = trackIndex;
+        this._selectedAudioStreamIndex = trackIndex;
+        this.setVolume(this._volume);
     } catch (err) {
         console.warn('Failed to activate external audio:', err);
         this._deactivateExternalAudio();
+        throw err;
     }
 };
 
 LibmediaPlayer.prototype._deactivateExternalAudio = function () {
-    try { this._extAudioPlayer?.stop?.(); } catch {}
-    try { this._extAudioPlayer?.destroy?.(); } catch {}
-    this._extAudioPlayer = null;
-    this._extAudioStream = null;
-    if (this._extAudioElement) { tryRemoveElement(this._extAudioElement); }
-    this._extAudioElement = null;
-    if (this._mutedMainDueToExternal) {
-        try { this._avplayer?.setVolume?.((this._volume || 0) / 100, true); } catch {}
-        this._mutedMainDueToExternal = false;
-    }
     this._externalAudioActive = false;
     this._extAudioSelectedIndex = null;
-};
-
-LibmediaPlayer.prototype._syncExternalAudioTime = function () {
-    if (!this._externalAudioActive || !this._extAudioPlayer || !this._avplayer) return;
-    try {
-        // If seek is ongoing (main or aux), defer resync to avoid chase oscillation
-        if (this._mainSeekInProgress || this._extAudioSeekInProgress || !this._extAudioPrimed) return;
-        const mainMs = Number(this._avplayer.currentTime || 0n);
-        const auxMs = Number(this._extAudioPlayer.currentTime || 0n);
-        const drift = (auxMs - mainMs) / 1000;
-        const now = performance.now ? performance.now() : Date.now();
-        // Rate-limit resyncs to avoid rapid reseek loops
-        if (this._extAudioLastResyncTs && (now - this._extAudioLastResyncTs) < 500) return;
-        // Only sync if drift is significant and we have the correct stream index
-        if (Math.abs(drift) > 0.2 && this._extAudioStreamIndex >= 0) {
-            this._extAudioSeekInProgress = true;
-            // Use doSeek with correct streamIndex and AVSeekFlags.FRAME for frame-accurate seeking
-            try {
-                const targetMs = Math.max(0, mainMs);
-                // Call doSeek directly with streamIndex - this is the correct way for libmedia
-                this._extAudioPlayer.doSeek?.(BigInt(targetMs), this._extAudioStreamIndex);
-            } catch {
-                // Fallback to simple seek if doSeek is not available
-                this._extAudioPlayer.seek?.(BigInt(Math.max(0, mainMs)));
-            }
-            this._extAudioLastResyncTs = now;
-        }
-    } catch {}
 };

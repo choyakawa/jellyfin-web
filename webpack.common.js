@@ -21,37 +21,38 @@ const Assets = [
     'libpgs/dist/libpgs.worker.js'
 ];
 
-// Optional libmedia runtime (copied only if installed locally)
-const LIBMEDIA_UMD_DIR = path.resolve(__dirname, 'node_modules/@libmedia/avplayer/dist/umd');
-const LIBMEDIA_ESM_DIR = path.resolve(__dirname, 'node_modules/@libmedia/avplayer/dist/esm');
-const LibmediaAssets = fs.existsSync(LIBMEDIA_ESM_DIR) || fs.existsSync(LIBMEDIA_UMD_DIR)
+// Optional libmedia runtime. Prefer the sibling source checkout so Jellyfin uses
+// the patched libmedia build without changing package.json back to npm.
+const LOCAL_LIBMEDIA_DIST = path.resolve(__dirname, '../libmedia/dist');
+const LOCAL_LIBMEDIA_AVPLAYER_DIR = path.resolve(LOCAL_LIBMEDIA_DIST, 'avplayer');
+const LOCAL_LIBMEDIA_AVPLAYER_BUNDLE = path.resolve(LOCAL_LIBMEDIA_AVPLAYER_DIR, 'avplayer.js');
+const LibmediaAssets = fs.existsSync(LOCAL_LIBMEDIA_AVPLAYER_BUNDLE)
     ? [
-        // ESM bundle for dynamic import (avoids import.meta issues in some UMDs)
-        ...(fs.existsSync(LIBMEDIA_ESM_DIR) ? [
-            {
-                from: path.resolve(LIBMEDIA_ESM_DIR, 'avplayer.js'),
-                to: 'libraries/libmedia/esm/avplayer.js'
-            },
-            {
-                from: '*.avplayer.js',
-                context: LIBMEDIA_ESM_DIR,
-                to: 'libraries/libmedia/esm/[name][ext]',
-                noErrorOnMissing: true
-            }
-        ] : []),
-        // UMD bundle fallback
-        ...(fs.existsSync(LIBMEDIA_UMD_DIR) ? [
-            {
-                from: path.resolve(LIBMEDIA_UMD_DIR, 'avplayer.js'),
-                to: 'libraries/libmedia/avplayer.js'
-            },
-            {
-                from: '*.avplayer.js',
-                context: LIBMEDIA_UMD_DIR,
-                to: 'libraries/libmedia/[name][ext]',
-                noErrorOnMissing: true
-            }
-        ] : [])
+        {
+            from: LOCAL_LIBMEDIA_AVPLAYER_BUNDLE,
+            to: 'libraries/libmedia/esm/avplayer.js'
+        },
+        {
+            from: '*.avplayer.js',
+            context: LOCAL_LIBMEDIA_AVPLAYER_DIR,
+            to: 'libraries/libmedia/esm/[name][ext]',
+            noErrorOnMissing: true
+        },
+        {
+            from: path.resolve(LOCAL_LIBMEDIA_DIST, 'decode'),
+            to: 'libraries/libmedia/decode',
+            noErrorOnMissing: true
+        },
+        {
+            from: path.resolve(LOCAL_LIBMEDIA_DIST, 'resample'),
+            to: 'libraries/libmedia/resample',
+            noErrorOnMissing: true
+        },
+        {
+            from: path.resolve(LOCAL_LIBMEDIA_DIST, 'stretchpitch'),
+            to: 'libraries/libmedia/stretchpitch',
+            noErrorOnMissing: true
+        }
     ]
     : [];
 
