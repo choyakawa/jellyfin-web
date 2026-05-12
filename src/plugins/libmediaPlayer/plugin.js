@@ -11,6 +11,7 @@ import { getIncludeCorsCredentials } from '../../scripts/settings/webSettings';
 import * as htmlMediaHelper from '../../components/htmlMediaHelper';
 import { ServerConnections } from 'lib/jellyfin-apiclient';
 import { playbackManager } from '../../components/playback/playbackmanager';
+import globalize from 'lib/globalize';
 
 function normalizeAVPlayerExports(mod) {
     const AVPlayer = mod?.default || window.AVPlayer;
@@ -44,6 +45,42 @@ function getAVPlayerLoadOptions(httpOptions, externalAudio) {
 function normalizeStreamIndex(index) {
     const value = Number(index);
     return Number.isFinite(value) ? value : null;
+}
+
+function getDisplayBitrate(bitrate) {
+    const value = Number(bitrate);
+    if (!Number.isFinite(value) || value <= 0) return '';
+    if (value > 1000000) {
+        return `${(value / 1000000).toFixed(1)} Mbps`;
+    }
+    return `${Math.floor(value / 1000)} kbps`;
+}
+
+function getProtocolFromUrl(url) {
+    if (!url) return '';
+    try {
+        const link = document.createElement('a');
+        link.href = url;
+        return (link.protocol || '').replace(':', '');
+    } catch {
+        return '';
+    }
+}
+
+async function invokeMaybeThreadMethod(target, methodName) {
+    const method = target?.[methodName];
+    if (!method) return null;
+    try {
+        if (typeof method === 'function') {
+            return await method.call(target);
+        }
+        if (typeof method.invoke === 'function') {
+            return await method.invoke();
+        }
+    } catch (err) {
+        console.debug(`[LibmediaPlayer] ${methodName} is not available`, err);
+    }
+    return null;
 }
 
 function zoomIn(elem) {
@@ -1119,6 +1156,166 @@ class LibmediaPlayer {
         } catch {
             return [];
         }
+    }
+
+    async _getLibmediaVideoDecodeInfo() {
+        const avplayer = this._avplayer;
+        if (!avplayer) return null;
+
+        const taskInfo = await invokeMaybeThreadMethod(avplayer.VideoDecoderThread, 'getTasksInfo');
+        const firstTask = Array.isArray(taskInfo) ? taskInfo[0] : null;
+        if (firstTask) {
+            return {
+                path: firstTask.hardware ? 'WebCodecs hardware' : 'Software (WebCodecs/WASM)',
+                detail: [
+                    firstTask.width && firstTask.height ? `${firstTask.width}x${firstTask.height}` : '',
+                    firstTask.framerate ? `${Number(firstTask.framerate).toFixed(2)} fps` : ''
+                ].filter(Boolean).join(', ')
+            };
+        }
+
+        if (avplayer.useMSE) {
+            return {
+                path: 'MSE / browser media pipeline',
+                detail: 'hardware status is browser-managed'
+            };
+        }
+
+        return null;
+    }
+
+    async getStats() {
+        const categories = [];
+        const avStats = this._avplayer?.getStats?.() || {};
+        const videoDecodeInfo = await this._getLibmediaVideoDecodeInfo();
+        const protocol = getProtocolFromUrl(this._currentSrc);
+
+        const mediaCategory = {
+            name: 'Libmedia',
+            stats: []
+        };
+        categories.push(mediaCategory);
+
+        if (protocol) {
+            mediaCategory.stats.push({
+                label: globalize.translate('LabelProtocol'),
+                value: protocol
+            });
+        }
+
+        mediaCategory.stats.push({
+            label: globalize.translate('LabelStreamType'),
+            value: this._avplayer?.useMSE ? 'MSE' : 'WebCodecs/WASM'
+        });
+
+        if (this._externalAudioActive) {
+            const audioStream = (this._currentPlayOptions?.mediaSource?.MediaStreams || [])
+                .find((stream) => stream.Type === 'Audio' && stream.Index === this._extAudioSelectedIndex);
+            mediaCategory.stats.push({
+                label: 'External audio',
+                value: audioStream?.DisplayTitle || audioStream?.Title || audioStream?.Path || `#${this._extAudioSelectedIndex}`
+            });
+        }
+
+        const videoCategory = {
+            stats: [],
+            type: 'video'
+        };
+        categories.push(videoCategory);
+
+        if (videoDecodeInfo?.path) {
+            videoCategory.stats.push({
+                label: 'Decoder path',
+                value: videoDecodeInfo.detail ? `${videoDecodeInfo.path} (${videoDecodeInfo.detail})` : videoDecodeInfo.path
+            });
+        }
+
+        if (avStats.videocodec) {
+            videoCategory.stats.push({
+                label: globalize.translate('LabelVideoCodec'),
+                value: avStats.videocodec
+            });
+        }
+
+        if (avStats.width && avStats.height) {
+            videoCategory.stats.push({
+                label: globalize.translate('LabelVideoResolution'),
+                value: `${avStats.width}x${avStats.height}`
+            });
+        }
+
+        if (avStats.videoBitrate > 0) {
+            videoCategory.stats.push({
+                label: globalize.translate('LabelVideoBitrate'),
+                value: getDisplayBitrate(avStats.videoBitrate * 8)
+            });
+        }
+
+        if (avStats.videoDecodeFramerate) {
+            videoCategory.stats.push({
+                label: 'Decode framerate',
+                value: `${avStats.videoDecodeFramerate} fps`
+            });
+        }
+
+        if (avStats.videoRenderFramerate) {
+            videoCategory.stats.push({
+                label: 'Render framerate',
+                value: `${avStats.videoRenderFramerate} fps`
+            });
+        }
+
+        if (avStats.videoFrameDropCount) {
+            videoCategory.stats.push({
+                label: globalize.translate('LabelDroppedFrames'),
+                value: avStats.videoFrameDropCount
+            });
+        }
+
+        const audioCategory = {
+            stats: [],
+            type: 'audio'
+        };
+        categories.push(audioCategory);
+
+        if (avStats.audiocodec) {
+            audioCategory.stats.push({
+                label: globalize.translate('LabelAudioCodec'),
+                value: avStats.audiocodec
+            });
+        }
+
+        if (avStats.audioBitrate > 0) {
+            audioCategory.stats.push({
+                label: globalize.translate('LabelAudioBitrate'),
+                value: getDisplayBitrate(avStats.audioBitrate * 8)
+            });
+        }
+
+        if (avStats.channels) {
+            audioCategory.stats.push({
+                label: globalize.translate('LabelAudioChannels'),
+                value: avStats.channels
+            });
+        }
+
+        if (avStats.sampleRate) {
+            audioCategory.stats.push({
+                label: globalize.translate('LabelAudioSampleRate'),
+                value: `${avStats.sampleRate} Hz`
+            });
+        }
+
+        if (avStats.audioDecodeFramerate) {
+            audioCategory.stats.push({
+                label: 'Decode framerate',
+                value: `${avStats.audioDecodeFramerate} fps`
+            });
+        }
+
+        return {
+            categories: categories.filter((category) => category.stats.length)
+        };
     }
 
     // Feature flags queried by OSD
