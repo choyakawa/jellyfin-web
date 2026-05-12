@@ -99,7 +99,7 @@ function tryRemoveElement(elem) {
 function getLibmediaWasmBaseUrl() {
     return `${appRouter.baseUrl()}/libraries/libmedia`;
 }
-const DEMO_USE_MSE = false;
+const DEMO_USE_MSE = true;
 const DEMO_ENABLE_HARDWARE_ACCELERATION = true;
 const DEMO_ENABLE_WEB_CODECS = true;
 const DEMO_ENABLE_WEB_GPU = true;
