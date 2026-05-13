@@ -273,7 +273,8 @@ function getDemoAVPlayerOptions(container, wasmBaseUrl, httpOptions) {
         jitterBufferMin: DEMO_JITTER_BUFFER_MIN,
         lowLatency: DEMO_LOW_LATENCY,
         wasmBaseUrl,
-        http: httpOptions
+        http: httpOptions,
+        subtitleRenderMode: 'event'
     };
 }
 
@@ -299,6 +300,8 @@ class LibmediaPlayer {
         // Subtitle state (Jellyfin-rendered)
         this._customTrackIndex = -1;
         this._customSecondaryTrackIndex = -1;
+        this.subtitleStreamIndex = -1;
+        this.secondarySubtitleStreamIndex = -1;
         this._currentTrackEvents = null;
         this._currentSecondaryTrackEvents = null;
         this._videoSubtitlesElem = null;
@@ -306,6 +309,10 @@ class LibmediaPlayer {
         this._currentTrackOffset = 0;
         this._secondaryTrackOffset = 0;
         this._showSubtitleOffset = false;
+        this._embeddedSubtitleTrackIndex = -1;
+        this._embeddedSubtitleMode = null;
+        this._embeddedSubtitleEvents = [];
+        this._embeddedSubtitleEventKeys = new Set();
         this.setSubtitleOffset = debounce(this._setSubtitleOffset.bind(this), 100);
         this._httpOptions = null;
         // Bound handler for browser back/forward navigation (popstate)
@@ -369,6 +376,7 @@ class LibmediaPlayer {
         this._started = false;
         this._timeUpdated = false;
         this._paused = false;
+        this._normalizeSubtitleDeliveryMethods(options);
         this._currentPlayOptions = options;
         this._selectedAudioStreamIndex = null;
         this._externalAudioActive = false;
@@ -379,10 +387,16 @@ class LibmediaPlayer {
         // reset jf-rendered subtitle state
         this._customTrackIndex = -1;
         this._customSecondaryTrackIndex = -1;
+        this.subtitleStreamIndex = -1;
+        this.secondarySubtitleStreamIndex = -1;
         this._currentTrackEvents = null;
         this._currentSecondaryTrackEvents = null;
         this._currentTrackOffset = 0;
         this._secondaryTrackOffset = 0;
+        this._embeddedSubtitleTrackIndex = -1;
+        this._embeddedSubtitleMode = null;
+        this._embeddedSubtitleEvents = [];
+        this._embeddedSubtitleEventKeys = new Set();
         this._destroyCustomTrack();
 
         await ensureAVPlayerLoaded();
@@ -434,7 +448,7 @@ class LibmediaPlayer {
         this._httpOptions = httpOptions;
         this._playlist = options.items || [];
         this._playlistIndex = options.startIndex || 0;
-        // Ensure subtitle DeliveryUrl are absolute/filled to avoid apiClient.getUrl errors later
+        // Only external subtitles need server subtitle URLs; embedded subtitles stay inside libmedia.
         try { this._ensureSubtitleDeliveryUrls(options); } catch {}
         const externalAudio = this._getExternalAudioLoadOptions(options);
         externalAudio.forEach((audio) => {
@@ -478,25 +492,11 @@ class LibmediaPlayer {
                 }
             }
 
-            // Ensure subtitles bound after initial play start as well
-            try { this._reapplySubtitlesAfterPipelineChange(); } catch {}
-
             // Notify playback manager (self-managing) that item started
             try {
                 Events.trigger(this, 'itemstarted', [options.item, options.mediaSource]);
             } catch (e) {
                 // ignore
-            }
-
-            // seek to start position if requested
-            const startTicks = options.playerStartPositionTicks || 0;
-            if (startTicks > 0) {
-                const ms = BigInt(Math.floor(startTicks / 10000));
-                try {
-                    await this._avplayer.seek(ms);
-                } catch (err) {
-                    console.warn('Initial seek failed:', err);
-                }
             }
 
             // Auto select initial audio/subtitle per Jellyfin defaults
@@ -506,10 +506,21 @@ class LibmediaPlayer {
                     await this.setAudioStreamIndex(ms.DefaultAudioStreamIndex);
                 }
                 if (ms?.DefaultSubtitleStreamIndex != null) {
-                    this.setSubtitleStreamIndex(ms.DefaultSubtitleStreamIndex);
+                    await this.setSubtitleStreamIndex(ms.DefaultSubtitleStreamIndex);
                 }
             } catch (error) {
                 console.warn('Error setting default streams:', error);
+            }
+
+            // Seek after selecting subtitle so libmedia seeks the active subtitle stream too.
+            const startTicks = options.playerStartPositionTicks || 0;
+            if (startTicks > 0) {
+                const ms = BigInt(Math.floor(startTicks / 10000));
+                try {
+                    await this._avplayer.seek(ms);
+                } catch (err) {
+                    console.warn('Initial seek failed:', err);
+                }
             }
 
             // Show UI after playback starts.
@@ -545,20 +556,6 @@ class LibmediaPlayer {
         // Do not auto-tear down on browser navigation; let OSD/router manage lifecycle
     }
 
-    _reapplySubtitlesAfterPipelineChange() {
-        const ms = this._currentPlayOptions?.mediaSource;
-        const item = this._currentPlayOptions?.item;
-        if (!ms || !item) return;
-        if (this._customTrackIndex != null && this._customTrackIndex >= 0) {
-            this.setSubtitleStreamIndex(this._customTrackIndex);
-        } else if (ms.DefaultSubtitleStreamIndex != null && ms.DefaultSubtitleStreamIndex >= 0) {
-            this.setSubtitleStreamIndex(ms.DefaultSubtitleStreamIndex);
-        }
-        if (this._customSecondaryTrackIndex != null && this._customSecondaryTrackIndex >= 0) {
-            this.setSecondarySubtitleStreamIndex(this._customSecondaryTrackIndex);
-        }
-    }
-
     _computeUrl(options) {
         // Prefer precomputed streamInfo.url
         if (options?.url) return options.url;
@@ -588,6 +585,20 @@ class LibmediaPlayer {
         return apiClient.getUrl(`${prefix}/${item.Id}/stream.${container}`, directOptions);
     }
 
+    _normalizeSubtitleDeliveryMethods(options) {
+        const streams = options?.mediaSource?.MediaStreams || [];
+        streams.forEach((stream) => {
+            if (stream.Type !== 'Subtitle') {
+                return;
+            }
+            if (stream.IsExternal) {
+                stream.DeliveryMethod = 'External';
+            } else {
+                stream.DeliveryMethod = 'Embed';
+            }
+        });
+    }
+
     _ensureSubtitleDeliveryUrls(options) {
         try {
             const item = options?.item;
@@ -607,6 +618,7 @@ class LibmediaPlayer {
             const streams = mediaSource.MediaStreams || [];
             for (const s of streams) {
                 if (s.Type !== 'Subtitle') continue;
+                if (this._isEmbeddedSubtitleTrack(s)) continue;
                 let url = s.DeliveryUrl || '';
                 if (!url || url.startsWith('/')) {
                     // Use the extension from s.Path, fallback to Codec
@@ -641,6 +653,9 @@ class LibmediaPlayer {
             } catch {}
             Events.trigger(this, 'timeupdate');
         });
+        this._avplayer.on?.(ev.SUBTITLE_CUE || 'subtitleCue', (cue) => {
+            this._onLibmediaSubtitleCue(cue);
+        });
         this._avplayer.on?.(ev.PAUSED || 'paused', () => {
             this._paused = true;
             Events.trigger(this, 'pause');
@@ -667,6 +682,14 @@ class LibmediaPlayer {
         // Avoid early 'playing' on LOADED to prevent OSD state machine from restarting playback
         this._avplayer.on?.(ev.LOADED || 'loaded', () => {});
         this._avplayer.on?.(ev.SEEKING || 'seeking', () => {
+            if (this._embeddedSubtitleMode === 'event') {
+                this._embeddedSubtitleEvents = [];
+                this._embeddedSubtitleEventKeys = new Set();
+                this._currentTrackEvents = this._embeddedSubtitleEvents;
+                if (this._videoSubtitlesElem) {
+                    this._videoSubtitlesElem.classList.add('hide');
+                }
+            }
             Events.trigger(this, 'waiting');
         });
         this._avplayer.on?.(ev.SEEKED || 'seeked', () => {
@@ -682,8 +705,6 @@ class LibmediaPlayer {
             Events.trigger(this, 'error', [err?.message || 'ErrorDefault']);
         });
         this._avplayer.on?.(ev.STREAM_UPDATE || 'streamUpdate', () => {
-            // If streams update (e.g., after fallback or dynamic probe), ensure subtitles are considered
-            try { this._reapplySubtitlesAfterPipelineChange(); } catch {}
             Events.trigger(this, 'mediastreamschange');
         });
         this._avplayer.on?.(ev.VOLUME_CHANGE || 'volumeChange', () => {
@@ -721,6 +742,18 @@ class LibmediaPlayer {
 
     currentSrc() {
         return this._currentSrc;
+    }
+
+    currentItem() {
+        return this._currentPlayOptions?.item || null;
+    }
+
+    currentMediaSource() {
+        return this._currentPlayOptions?.mediaSource || null;
+    }
+
+    playMethod() {
+        return 'DirectPlay';
     }
 
     // milliseconds in/out (playbackmanager expects ms)
@@ -924,8 +957,8 @@ class LibmediaPlayer {
         }
     }
 
-    setSubtitleStreamIndex(index) {
-        // Jellyfin-rendered subtitles only. Allow rendering even without <video> (will fallback to custom element)
+    async setSubtitleStreamIndex(index) {
+        // Select the active subtitle without asking Jellyfin to change media streams.
         const video = this._getVideoElement();
         const mediaSource = this._currentPlayOptions?.mediaSource;
         const item = this._currentPlayOptions?.item;
@@ -934,6 +967,7 @@ class LibmediaPlayer {
         // destroy when disabled (do not touch player instance)
         if (index == null || index === -1) {
             this._customTrackIndex = -1;
+            this.subtitleStreamIndex = -1;
             this._destroyCustomTrack(0); // destroy primary
             // notify UI that only subtitle state changed
             Events.trigger(this, 'mediastreamschange');
@@ -947,28 +981,43 @@ class LibmediaPlayer {
             return;
         }
 
-        this._setTrackForDisplay(video, track, item, 0);
+        try {
+            await this._setTrackForDisplay(video, track, item, 0);
+            this.subtitleStreamIndex = track.Index;
+            Events.trigger(this, 'mediastreamschange');
+        } catch (err) {
+            console.error('[LibmediaPlayer] Failed to set subtitle track:', err);
+            this.subtitleStreamIndex = -1;
+            this._destroyCustomTrack(PRIMARY_TEXT_TRACK_INDEX);
+            Events.trigger(this, 'mediastreamschange');
+        }
     }
 
     getSubtitleStreamIndex() {
         return this._customTrackIndex == null ? -1 : this._customTrackIndex;
     }
 
+    subtitleTracks() {
+        const mediaStreams = this._currentPlayOptions?.mediaSource?.MediaStreams || [];
+        return mediaStreams.filter((stream) => stream.Type === 'Subtitle');
+    }
 
-    _mapJellyfinStreamIndexToLibId(jfIndex, kind /* 'audio' */) {
+    _mapJellyfinStreamIndexToLibId(jfIndex, kind /* 'audio' | 'subtitle' */) {
         try {
             jfIndex = normalizeStreamIndex(jfIndex);
             if (jfIndex == null) return null;
 
             const streams = this._avplayer.getStreams?.() || [];
             const jfStreams = this._currentPlayOptions?.mediaSource?.MediaStreams || [];
-            const jfStream = jfStreams.find((s) => s.Index === jfIndex && (kind === 'audio' ? s.Type === 'Audio' : false));
+            const jfType = kind === 'subtitle' ? 'Subtitle' : 'Audio';
+            const jfStream = jfStreams.find((s) => s.Index === jfIndex && s.Type === jfType);
             if (!jfStream) return null;
 
             // Get streams of the same type from libmedia
             const libStreams = streams.filter((s) => {
                 const codecType = s.codecpar?.codecType || s.codecparProxy?.codecType;
                 if (kind === 'audio') return codecType === 1 || String(codecType) === 'AVMEDIA_TYPE_AUDIO';
+                if (kind === 'subtitle') return codecType === 3 || String(codecType) === 'AVMEDIA_TYPE_SUBTITLE';
                 return false;
             });
 
@@ -980,7 +1029,7 @@ class LibmediaPlayer {
             }
 
             // Get jellyfin streams of the same type (excluding external ones for ordering)
-            const jfStreamsOfType = jfStreams.filter((s) => s.Type === 'Audio' && !s.IsExternal).sort((a, b) => a.Index - b.Index);
+            const jfStreamsOfType = jfStreams.filter((s) => s.Type === jfType && !s.IsExternal).sort((a, b) => a.Index - b.Index);
 
             // Find the position of the target stream in jellyfin streams of the same type
             const jfStreamPosition = jfStreamsOfType.findIndex((s) => s.Index === jfIndex);
@@ -1004,7 +1053,8 @@ class LibmediaPlayer {
                 // Try to match by language first, then title, then codec
                 if (lang && sLang === lang) return true;
                 if (title && sTitle === title) return true;
-                if (codec && s.codecpar?.codecId && this._getCodecName(s.codecpar.codecId).toLowerCase().includes(codec)) return true;
+                const codecId = s.codecpar?.codecId || s.codecparProxy?.codecId;
+                if (codec && codecId && this._getCodecName(codecId).toLowerCase().includes(codec)) return true;
 
                 return false;
             });
@@ -1039,20 +1089,29 @@ class LibmediaPlayer {
     }
 
     // SECONDARY SUBTITLE API (client side only)
-    setSecondarySubtitleStreamIndex(index) {
+    async setSecondarySubtitleStreamIndex(index) {
         const video = this._getVideoElement();
-        if (!video) return;
         const mediaSource = this._currentPlayOptions?.mediaSource;
         const item = this._currentPlayOptions?.item;
         if (!mediaSource || !item) return;
         if (index == null || index === -1) {
             this._customSecondaryTrackIndex = -1;
+            this.secondarySubtitleStreamIndex = -1;
             this._destroyCustomTrack(1);
             return;
         }
         const track = (mediaSource.MediaStreams || []).find(t => t.Type === 'Subtitle' && t.Index === index);
         if (!track) return;
-        this._setTrackForDisplay(video, track, item, 1);
+        try {
+            await this._setTrackForDisplay(video, track, item, 1);
+            this.secondarySubtitleStreamIndex = track.Index;
+            Events.trigger(this, 'mediastreamschange');
+        } catch (err) {
+            console.error('[LibmediaPlayer] Failed to set secondary subtitle track:', err);
+            this.secondarySubtitleStreamIndex = -1;
+            this._destroyCustomTrack(SECONDARY_TEXT_TRACK_INDEX);
+            Events.trigger(this, 'mediastreamschange');
+        }
     }
 
     // Minimal playlist management to integrate with playbackmanager when local
@@ -1103,6 +1162,15 @@ class LibmediaPlayer {
     // Subtitles offset (seconds, client-side)
     _setSubtitleOffset(offsetSeconds) {
         const offsetValue = parseFloat(offsetSeconds) || 0;
+        if (this._embeddedSubtitleTrackIndex != null && this._embeddedSubtitleTrackIndex >= 0) {
+            this._updateCurrentTrackOffset(offsetValue);
+            try {
+                this._avplayer?.setSubtitleDelay?.(Math.round(-offsetValue * 1000));
+            } catch (err) {
+                console.debug('[LibmediaPlayer] Failed to set embedded subtitle delay', err);
+            }
+            return;
+        }
         // ASS
         if (this._currentAssRenderer) {
             this._updateCurrentTrackOffset(offsetValue);
@@ -1613,21 +1681,25 @@ class LibmediaPlayer {
     _destroyStoredTrackInfo(targetTrackIndex) {
         if (targetTrackIndex === PRIMARY_TEXT_TRACK_INDEX || targetTrackIndex == null) {
             this._customTrackIndex = -1;
+            this.subtitleStreamIndex = -1;
             this._currentTrackEvents = null;
         }
         if (targetTrackIndex === SECONDARY_TEXT_TRACK_INDEX || targetTrackIndex == null) {
             this._customSecondaryTrackIndex = -1;
+            this.secondarySubtitleStreamIndex = -1;
             this._currentSecondaryTrackEvents = null;
         }
     }
 
     _destroyCustomTrack(targetTrackIndex) {
+        this._deactivateEmbeddedSubtitle(targetTrackIndex);
         this._destroyCustomRenderedTrackElements(targetTrackIndex);
         this._destroyStoredTrackInfo(targetTrackIndex);
         const ass = this._currentAssRenderer; if (ass) { try { ass.dispose(); } catch {} }
         this._currentAssRenderer = null;
         const pgs = this._currentPgsRenderer; if (pgs) { try { pgs.dispose(); } catch {} }
         this._currentPgsRenderer = null;
+        if (this._pgsCustomCanvas) { tryRemoveElement(this._pgsCustomCanvas); this._pgsCustomCanvas = null; }
     }
 
     _requiresCustomSubtitlesElement(/* userSettings */) {
@@ -1657,20 +1729,170 @@ class LibmediaPlayer {
         return url;
     }
 
+    _isEmbeddedSubtitleTrack(track) {
+        return track?.Type === 'Subtitle' && !track.IsExternal;
+    }
+
+    _isAssSubtitleTrack(track) {
+        const format = (track?.Codec || '').toLowerCase();
+        return format === 'ass' || format === 'ssa';
+    }
+
+    _canUseLibmediaTextSubtitle(track) {
+        const format = (track?.Codec || '').toLowerCase();
+        return ['srt', 'subrip', 'vtt', 'webvtt', 'text', 'txt', 'mov_text', 'ttml'].includes(format);
+    }
+
+    async _activateLibmediaSubtitleTrack(track, mode) {
+        const libId = this._mapJellyfinStreamIndexToLibId(track.Index, 'subtitle');
+        if (libId == null) {
+            throw new Error(`Embedded subtitle stream ${track.Index} is not available in libmedia`);
+        }
+        this._embeddedSubtitleTrackIndex = track.Index;
+        this._embeddedSubtitleMode = mode;
+        this._avplayer?.setSubtitleRenderMode?.(mode);
+        if (this._avplayer?.getSelectedSubtitleStreamId?.() !== libId) {
+            await this._avplayer?.selectSubtitle?.(libId);
+        }
+        this._avplayer?.setSubtitleEnable?.(true);
+    }
+
+    _deactivateEmbeddedSubtitle(targetTextTrackIndex) {
+        if (targetTextTrackIndex != null && targetTextTrackIndex !== PRIMARY_TEXT_TRACK_INDEX) {
+            return;
+        }
+        this._embeddedSubtitleTrackIndex = -1;
+        this._embeddedSubtitleMode = null;
+        this._embeddedSubtitleEvents = [];
+        this._embeddedSubtitleEventKeys?.clear?.();
+        if (this._videoSubtitlesElem) {
+            this._videoSubtitlesElem.classList.add('hide');
+        }
+        try {
+            this._avplayer?.setSubtitleEnable?.(false);
+        } catch (err) {
+            console.debug('[LibmediaPlayer] Failed to disable embedded subtitles', err);
+        }
+        try {
+            this._avplayer?.setSubtitleRenderMode?.('event');
+        } catch (err) {
+            console.debug('[LibmediaPlayer] Failed to reset embedded subtitle mode', err);
+        }
+    }
+
+    _onLibmediaSubtitleCue(cue) {
+        if (this._embeddedSubtitleTrackIndex == null || this._embeddedSubtitleTrackIndex < 0) {
+            return;
+        }
+        if (this._embeddedSubtitleMode !== 'event') {
+            return;
+        }
+        if (!this._currentTrackEvents) {
+            return;
+        }
+
+        const startMs = Number(cue?.start ?? cue?.startMs ?? 0);
+        let endMs = Number(cue?.end ?? cue?.endMs ?? 0);
+        const durationMs = Number(cue?.duration ?? 0);
+        if (!Number.isFinite(startMs)) {
+            return;
+        }
+        if (!Number.isFinite(endMs) || endMs <= startMs) {
+            endMs = startMs + (Number.isFinite(durationMs) && durationMs > 0 ? durationMs : 5000);
+        }
+        const text = String(cue?.text || '');
+        const key = `${startMs}:${endMs}:${text}`;
+        if (this._embeddedSubtitleEventKeys?.has(key)) {
+            return;
+        }
+        this._embeddedSubtitleEventKeys?.add(key);
+
+        this._currentTrackEvents.push({
+            StartPositionTicks: startMs * 10000,
+            EndPositionTicks: endMs * 10000,
+            Text: text
+        });
+        this._currentTrackEvents.sort((a, b) => a.StartPositionTicks - b.StartPositionTicks);
+
+        const currentTicks = Number(this._avplayer?.currentTime || 0n) * 10000;
+        const keepAfter = currentTicks - 600 * 10000000;
+        while (this._currentTrackEvents.length > 0 && this._currentTrackEvents[0].EndPositionTicks < keepAfter) {
+            const removed = this._currentTrackEvents.shift();
+            const removedKey = `${removed.StartPositionTicks / 10000}:${removed.EndPositionTicks / 10000}:${removed.Text || ''}`;
+            this._embeddedSubtitleEventKeys?.delete(removedKey);
+        }
+    }
+
+    async _renderEmbeddedTextSubtitle(track, targetTextTrackIndex = PRIMARY_TEXT_TRACK_INDEX) {
+        if (this._isSecondaryTrack(targetTextTrackIndex)) {
+            console.warn('[LibmediaPlayer] Embedded secondary text subtitles are not supported by the current libmedia bridge');
+            return;
+        }
+
+        if (!this._videoSubtitlesElem) {
+            let container = document.querySelector('.videoSubtitles');
+            if (!container) {
+                container = document.createElement('div');
+                container.classList.add('videoSubtitles');
+                (this._videoDialog || document.body).appendChild(container);
+            }
+            const inner = document.createElement('div');
+            inner.classList.add('videoSubtitlesInner');
+            container.appendChild(inner);
+            this._videoSubtitlesElem = inner;
+            await this._setSubtitleAppearance(container, inner);
+        }
+
+        this._embeddedSubtitleEvents = [];
+        this._embeddedSubtitleEventKeys = new Set();
+        this._currentTrackEvents = this._embeddedSubtitleEvents;
+        await this._activateLibmediaSubtitleTrack(track, 'event');
+    }
+
+    async _renderEmbeddedSubtitleWithLibmedia(track, targetTextTrackIndex = PRIMARY_TEXT_TRACK_INDEX) {
+        if (this._isSecondaryTrack(targetTextTrackIndex)) {
+            console.warn('[LibmediaPlayer] Embedded secondary subtitles are not supported by the current libmedia bridge');
+            return;
+        }
+
+        this._currentTrackEvents = null;
+        await this._activateLibmediaSubtitleTrack(track, 'render');
+    }
+
     async _setTrackForDisplay(videoElement, track, item, targetTextTrackIndex = PRIMARY_TEXT_TRACK_INDEX) {
         if (!track) {
             this._destroyCustomTrack(this._isSecondaryTrack(targetTextTrackIndex) ? targetTextTrackIndex : undefined);
             return;
         }
         if (this._isSecondaryTrack(targetTextTrackIndex)) {
-            if (this._customSecondaryTrackIndex === track.Index) return;
-        } else if (this._customTrackIndex === track.Index) return;
+            if (this._customSecondaryTrackIndex === track.Index) {
+                return;
+            }
+        } else if (this._customTrackIndex === track.Index) {
+            return;
+        }
 
         this.resetSubtitleOffset();
         this._destroyCustomTrack(targetTextTrackIndex);
-        if (this._isSecondaryTrack(targetTextTrackIndex)) this._customSecondaryTrackIndex = track.Index; else this._customTrackIndex = track.Index;
+        if (this._isSecondaryTrack(targetTextTrackIndex)) {
+            this._customSecondaryTrackIndex = track.Index;
+        } else {
+            this._customTrackIndex = track.Index;
+        }
 
         const format = (track.Codec || '').toLowerCase();
+        if (this._isEmbeddedSubtitleTrack(track)) {
+            if (this._isAssSubtitleTrack(track)) {
+                await this._renderEmbeddedSubtitleWithLibmedia(track, targetTextTrackIndex);
+                return;
+            }
+            if (this._canUseLibmediaTextSubtitle(track)) {
+                await this._renderEmbeddedTextSubtitle(track, targetTextTrackIndex);
+                return;
+            }
+            await this._renderEmbeddedSubtitleWithLibmedia(track, targetTextTrackIndex);
+            return;
+        }
         if (format === 'ssa' || format === 'ass') {
             await this._renderSsaAss(videoElement, track, item);
             return;
@@ -1892,7 +2114,6 @@ class LibmediaPlayer {
 }
 
 export default LibmediaPlayer;
-
 
 // ---------------------
 // Jellyfin subtitle rendering helpers (ported/minimized from HtmlVideoPlayer)
