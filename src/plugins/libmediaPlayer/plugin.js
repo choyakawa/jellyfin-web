@@ -313,6 +313,10 @@ class LibmediaPlayer {
         this._embeddedSubtitleMode = null;
         this._embeddedSubtitleEvents = [];
         this._embeddedSubtitleEventKeys = new Set();
+        this._embeddedPgsChunks = [];
+        this._embeddedPgsPacketKeys = new Set();
+        this._embeddedPgsLoadTimer = null;
+        this._embeddedPgsCuePromise = Promise.resolve();
         this.setSubtitleOffset = debounce(this._setSubtitleOffset.bind(this), 100);
         this._httpOptions = null;
         // Bound handler for browser back/forward navigation (popstate)
@@ -397,6 +401,7 @@ class LibmediaPlayer {
         this._embeddedSubtitleMode = null;
         this._embeddedSubtitleEvents = [];
         this._embeddedSubtitleEventKeys = new Set();
+        this._resetEmbeddedPgsState();
         this._destroyCustomTrack();
 
         await ensureAVPlayerLoaded();
@@ -650,6 +655,7 @@ class LibmediaPlayer {
             try {
                 const timeMs = Number(this._avplayer?.currentTime || 0n);
                 this._updateSubtitleText(timeMs);
+                this._renderCurrentPgs(timeMs);
             } catch {}
             Events.trigger(this, 'timeupdate');
         });
@@ -1700,6 +1706,7 @@ class LibmediaPlayer {
         const pgs = this._currentPgsRenderer; if (pgs) { try { pgs.dispose(); } catch {} }
         this._currentPgsRenderer = null;
         if (this._pgsCustomCanvas) { tryRemoveElement(this._pgsCustomCanvas); this._pgsCustomCanvas = null; }
+        this._resetEmbeddedPgsState();
     }
 
     _requiresCustomSubtitlesElement(/* userSettings */) {
@@ -1717,16 +1724,45 @@ class LibmediaPlayer {
     _getTextTrackUrl(track, item, format) {
         // Always derive from Jellyfin helper to ensure server produces the correct JSON endpoint (.js)
         // Avoid using DeliveryUrl directly, which may point to raw .srt/.ass files
-        let url = playbackManager.getSubtitleUrl(track, item.ServerId);
+        let url = '';
+        try {
+            if (track?.DeliveryUrl) {
+                url = playbackManager.getSubtitleUrl(track, item.ServerId);
+            }
+        } catch (err) {
+            console.debug('[LibmediaPlayer] Failed to resolve subtitle URL from playback manager', err);
+        }
+        if (!url) {
+            url = this._buildSubtitleStreamUrl(track, item, format);
+        }
         if (format) {
             // Replace terminal extension (default .vtt) with desired format, preserving query string
-            url = url.replace(/\.(vtt|srt|ass|ssa|pgssub|sub)(?=($|\?))/i, format);
-            if (!/\.(js|vtt|srt|ass|ssa|pgssub|sub)(?=($|\?))/i.test(url)) {
+            url = url.replace(/\.(js|vtt|srt|ass|ssa|pgssub|sup|sub)(?=($|\?))/i, format);
+            if (!/\.(js|vtt|srt|ass|ssa|pgssub|sup|sub)(?=($|\?))/i.test(url)) {
                 const qsIndex = url.indexOf('?');
                 url = qsIndex >= 0 ? `${url.slice(0, qsIndex)}${format}${url.slice(qsIndex)}` : `${url}${format}`;
             }
         }
         return url;
+    }
+
+    _buildSubtitleStreamUrl(track, item, format) {
+        const mediaSource = this._currentPlayOptions?.mediaSource;
+        const apiClient = ServerConnections.getApiClient(item.ServerId);
+        if (!mediaSource?.Id) {
+            return '';
+        }
+        const directOptions = {
+            Static: true,
+            mediaSourceId: mediaSource?.Id,
+            deviceId: apiClient.deviceId(),
+            ApiKey: apiClient.accessToken()
+        };
+        if (mediaSource?.ETag) directOptions.Tag = mediaSource.ETag;
+        if (mediaSource?.LiveStreamId) directOptions.LiveStreamId = mediaSource.LiveStreamId;
+        const codec = (track?.Codec || '').toLowerCase();
+        const ext = (format || `.${codec || 'vtt'}`).replace(/^\./, '');
+        return apiClient.getUrl(`Videos/${item.Id}/${mediaSource?.Id}/Subtitles/${track.Index}/stream.${ext}`, directOptions);
     }
 
     _isEmbeddedSubtitleTrack(track) {
@@ -1736,6 +1772,11 @@ class LibmediaPlayer {
     _isAssSubtitleTrack(track) {
         const format = (track?.Codec || '').toLowerCase();
         return format === 'ass' || format === 'ssa';
+    }
+
+    _isPgsSubtitleTrack(track) {
+        const format = (track?.Codec || '').toLowerCase();
+        return format === 'pgssub' || format === 'hdmv_pgs';
     }
 
     _canUseLibmediaTextSubtitle(track) {
@@ -1787,6 +1828,10 @@ class LibmediaPlayer {
         if (this._embeddedSubtitleMode !== 'event') {
             return;
         }
+        if (cue?.type === 'pgs') {
+            this._onLibmediaPgsCue(cue);
+            return;
+        }
         if (!this._currentTrackEvents) {
             return;
         }
@@ -1820,6 +1865,265 @@ class LibmediaPlayer {
             const removed = this._currentTrackEvents.shift();
             const removedKey = `${removed.StartPositionTicks / 10000}:${removed.EndPositionTicks / 10000}:${removed.Text || ''}`;
             this._embeddedSubtitleEventKeys?.delete(removedKey);
+        }
+    }
+
+    _resetEmbeddedPgsState() {
+        this._embeddedPgsChunks = [];
+        this._embeddedPgsPacketKeys = new Set();
+        this._embeddedPgsCuePromise = Promise.resolve();
+        if (this._embeddedPgsLoadTimer) {
+            clearTimeout(this._embeddedPgsLoadTimer);
+            this._embeddedPgsLoadTimer = null;
+        }
+    }
+
+    _cueDataToUint8Array(data) {
+        if (!data) return null;
+        if (data instanceof Uint8Array) return data;
+        if (data.buffer instanceof ArrayBuffer) {
+            return new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength || data.buffer.byteLength);
+        }
+        if (data instanceof ArrayBuffer) return new Uint8Array(data);
+        if (Array.isArray(data)) return new Uint8Array(data);
+        return null;
+    }
+
+    _isLikelyZlibBuffer(data) {
+        if (!data || data.length < 2 || data[0] !== 0x78) {
+            return false;
+        }
+        return (((data[0] << 8) | data[1]) % 31) === 0;
+    }
+
+    _isPgsSegmentStream(data) {
+        if (!data?.length) {
+            return false;
+        }
+        if (data.length >= 2 && data[0] === 0x50 && data[1] === 0x47) {
+            return true;
+        }
+
+        const supportedTypes = new Set([0x14, 0x15, 0x16, 0x17, 0x80]);
+        let offset = 0;
+        let count = 0;
+        while (offset + 3 <= data.length) {
+            const type = data[offset];
+            if (!supportedTypes.has(type)) {
+                return false;
+            }
+            const size = (data[offset + 1] << 8) | data[offset + 2];
+            const nextOffset = offset + 3 + size;
+            if (nextOffset > data.length) {
+                return false;
+            }
+            count++;
+            offset = nextOffset;
+        }
+        return count > 0 && offset === data.length;
+    }
+
+    async _inflateZlibBuffer(data) {
+        const DecompressionStreamCtor = globalThis.DecompressionStream;
+        if (!DecompressionStreamCtor || !globalThis.ReadableStream || !globalThis.Response) {
+            throw new Error('DecompressionStream is not available');
+        }
+        const readable = new ReadableStream({
+            start(controller) {
+                controller.enqueue(data);
+                controller.close();
+            }
+        });
+        const stream = readable.pipeThrough(new DecompressionStreamCtor('deflate'));
+        return new Uint8Array(await new Response(stream).arrayBuffer());
+    }
+
+    async _normalizeEmbeddedPgsPacket(data) {
+        if (this._isPgsSegmentStream(data)) {
+            return data;
+        }
+        if (!this._isLikelyZlibBuffer(data)) {
+            return data;
+        }
+        try {
+            const inflated = await this._inflateZlibBuffer(data);
+            if (this._isPgsSegmentStream(inflated)) {
+                return inflated;
+            }
+        } catch (err) {
+            console.warn('[LibmediaPlayer] Failed to inflate compressed embedded PGS packet', err);
+        }
+        return data;
+    }
+
+    _writeUint32BE(buffer, offset, value) {
+        buffer[offset] = (value >>> 24) & 0xff;
+        buffer[offset + 1] = (value >>> 16) & 0xff;
+        buffer[offset + 2] = (value >>> 8) & 0xff;
+        buffer[offset + 3] = value & 0xff;
+    }
+
+    _wrapPgsPacketForSup(data, startMs) {
+        if (data.length >= 2 && data[0] === 0x50 && data[1] === 0x47) {
+            return data.slice();
+        }
+
+        const pts90k = Math.max(0, Math.round(startMs * 90)) >>> 0;
+        const chunks = [];
+        let offset = 0;
+        while (offset + 3 <= data.length) {
+            const segmentSize = (data[offset + 1] << 8) | data[offset + 2];
+            const segmentLength = 3 + segmentSize;
+            if (segmentSize < 0 || offset + segmentLength > data.length) {
+                chunks.length = 0;
+                break;
+            }
+            const chunk = new Uint8Array(10 + segmentLength);
+            chunk[0] = 0x50;
+            chunk[1] = 0x47;
+            this._writeUint32BE(chunk, 2, pts90k);
+            this._writeUint32BE(chunk, 6, pts90k);
+            chunk.set(data.subarray(offset, offset + segmentLength), 10);
+            chunks.push(chunk);
+            offset += segmentLength;
+        }
+
+        if (!chunks.length || offset !== data.length) {
+            const chunk = new Uint8Array(10 + data.length);
+            chunk[0] = 0x50;
+            chunk[1] = 0x47;
+            this._writeUint32BE(chunk, 2, pts90k);
+            this._writeUint32BE(chunk, 6, pts90k);
+            chunk.set(data, 10);
+            return chunk;
+        }
+
+        return this._concatUint8Arrays(chunks);
+    }
+
+    _concatUint8Arrays(chunks) {
+        const size = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        const result = new Uint8Array(size);
+        let offset = 0;
+        for (const chunk of chunks) {
+            result.set(chunk, offset);
+            offset += chunk.length;
+        }
+        return result;
+    }
+
+    _hasPgsEndSegment(data) {
+        if (!data?.length) {
+            return false;
+        }
+
+        if (data.length >= 2 && data[0] === 0x50 && data[1] === 0x47) {
+            let offset = 0;
+            while (offset + 13 <= data.length) {
+                if (data[offset] !== 0x50 || data[offset + 1] !== 0x47) {
+                    return false;
+                }
+                const type = data[offset + 10];
+                const size = (data[offset + 11] << 8) | data[offset + 12];
+                if (type === 0x80) {
+                    return true;
+                }
+                offset += 13 + size;
+            }
+            return false;
+        }
+
+        let offset = 0;
+        while (offset + 3 <= data.length) {
+            const type = data[offset];
+            const size = (data[offset + 1] << 8) | data[offset + 2];
+            const nextOffset = offset + 3 + size;
+            if (nextOffset > data.length) {
+                return false;
+            }
+            if (type === 0x80) {
+                return true;
+            }
+            offset = nextOffset;
+        }
+        return false;
+    }
+
+    _hashPgsPacket(data) {
+        let hash = 2166136261;
+        for (let i = 0; i < data.length; i++) {
+            hash ^= data[i];
+            hash = Math.imul(hash, 16777619);
+        }
+        return hash >>> 0;
+    }
+
+    _queueEmbeddedPgsLoad() {
+        if (!this._currentPgsRenderer || this._embeddedPgsLoadTimer) {
+            return;
+        }
+        this._embeddedPgsLoadTimer = setTimeout(() => {
+            this._embeddedPgsLoadTimer = null;
+            if (!this._currentPgsRenderer || !this._embeddedPgsChunks.length) {
+                return;
+            }
+            try {
+                this._currentPgsRenderer.loadFromBuffer(this._concatUint8Arrays(this._embeddedPgsChunks).buffer);
+                this._renderCurrentPgs();
+            } catch (err) {
+                console.warn('[LibmediaPlayer] Failed to load embedded PGS packets', err);
+            }
+        }, 100);
+    }
+
+    _renderCurrentPgs(timeMs) {
+        if (!this._currentPgsRenderer) {
+            return;
+        }
+        const currentMs = timeMs == null ? Number(this._avplayer?.currentTime || 0n) : timeMs;
+        if (!Number.isFinite(currentMs)) {
+            return;
+        }
+        const timeOffset = (this._currentPlayOptions?.transcodingOffsetTicks || 0) / 10000000 + (this._currentTrackOffset || 0);
+        try {
+            this._currentPgsRenderer.renderAtTimestamp((currentMs / 1000) + timeOffset);
+        } catch {}
+    }
+
+    async _onLibmediaPgsCue(cue) {
+        this._embeddedPgsCuePromise = (this._embeddedPgsCuePromise || Promise.resolve())
+            .then(() => this._appendEmbeddedPgsCue(cue))
+            .catch((err) => {
+                console.warn('[LibmediaPlayer] Failed to append embedded PGS cue', err);
+            });
+    }
+
+    async _appendEmbeddedPgsCue(cue) {
+        let data = this._cueDataToUint8Array(cue?.data);
+        if (!data?.length || !this._currentPgsRenderer) {
+            return;
+        }
+        data = await this._normalizeEmbeddedPgsPacket(data);
+        if (!this._isPgsSegmentStream(data)) {
+            const type = data[0];
+            console.warn(`[LibmediaPlayer] Ignoring unsupported embedded PGS packet, first byte: ${type}`);
+            return;
+        }
+
+        const startMs = Number(cue?.start ?? cue?.startMs ?? 0);
+        if (!Number.isFinite(startMs)) {
+            return;
+        }
+
+        const key = `${startMs}:${data.length}:${this._hashPgsPacket(data)}`;
+        if (this._embeddedPgsPacketKeys.has(key)) {
+            return;
+        }
+        this._embeddedPgsPacketKeys.add(key);
+        const wrapped = this._wrapPgsPacketForSup(data, startMs);
+        this._embeddedPgsChunks.push(wrapped);
+        if (this._hasPgsEndSegment(data)) {
+            this._queueEmbeddedPgsLoad();
         }
     }
 
@@ -1882,6 +2186,10 @@ class LibmediaPlayer {
 
         const format = (track.Codec || '').toLowerCase();
         if (this._isEmbeddedSubtitleTrack(track)) {
+            if (this._isPgsSubtitleTrack(track)) {
+                await this._renderPgs(videoElement, track, item);
+                return;
+            }
             if (this._isAssSubtitleTrack(track)) {
                 await this._renderEmbeddedSubtitleWithLibmedia(track, targetTextTrackIndex);
                 return;
@@ -1967,42 +2275,58 @@ class LibmediaPlayer {
 
     async _renderPgs(videoElement, track, item) {
         const libpgs = await import('libpgs');
+        const isEmbedded = this._isEmbeddedSubtitleTrack(track);
+        const subUrl = isEmbedded ? null : this._getTextTrackUrl(track, item);
+        const createPgsCanvas = () => {
+            const canvas = document.createElement('canvas');
+            canvas.classList.add('libmedia-pgs-canvas');
+            this._container?.appendChild(canvas);
+            this._pgsCustomCanvas = canvas;
+            return canvas;
+        };
         // Ensure video/canvas target
         let targetVideo = videoElement;
         if (!targetVideo) {
             try {
                 targetVideo = this._ensureGhostVideoElement();
-            } catch (e) {
+            } catch {
                 // fallback to canvas overlay if ghost video cannot be created
-                const canvas = document.createElement('canvas');
-                canvas.style.position = 'absolute';
-                canvas.style.inset = '0';
-                canvas.style.width = '100%';
-                canvas.style.height = '100%';
-                canvas.style.pointerEvents = 'none';
-                this._container?.appendChild(canvas);
-                this._pgsCustomCanvas = canvas;
+                const canvas = createPgsCanvas();
                 const aspectRatio = this.getAspectRatio() === 'auto' ? 'contain' : this.getAspectRatio();
                 const options = {
                     canvas,
-                    subUrl: this._getTextTrackUrl(track, item),
                     workerUrl: `${appRouter.baseUrl()}/libraries/libpgs.worker.js`,
                     timeOffset: (this._currentPlayOptions?.transcodingOffsetTicks || 0) / 10000000,
                     aspectRatio
                 };
+                if (subUrl) {
+                    options.subUrl = subUrl;
+                }
                 this._currentPgsRenderer = new libpgs.PgsRenderer(options);
+                if (isEmbedded) {
+                    this._resetEmbeddedPgsState();
+                    await this._activateLibmediaSubtitleTrack(track, 'event');
+                }
                 return;
             }
         }
+        const canvas = createPgsCanvas();
         const aspectRatio = this.getAspectRatio() === 'auto' ? 'contain' : this.getAspectRatio();
         const options = {
             video: targetVideo,
-            subUrl: this._getTextTrackUrl(track, item),
+            canvas,
             workerUrl: `${appRouter.baseUrl()}/libraries/libpgs.worker.js`,
             timeOffset: (this._currentPlayOptions?.transcodingOffsetTicks || 0) / 10000000,
             aspectRatio
         };
+        if (subUrl) {
+            options.subUrl = subUrl;
+        }
         this._currentPgsRenderer = new libpgs.PgsRenderer(options);
+        if (isEmbedded) {
+            this._resetEmbeddedPgsState();
+            await this._activateLibmediaSubtitleTrack(track, 'event');
+        }
     }
 
     async _renderSubtitlesWithCustomElement(videoElement, track, item, targetTextTrackIndex = PRIMARY_TEXT_TRACK_INDEX) {
